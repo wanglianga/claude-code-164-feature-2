@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { NButton, NTag, NEmpty, NAlert, NGrid, NGridItem } from 'naive-ui'
-import { useState, nowStr, releaseBooking, endUsage } from '../store'
+import { useState, nowStr, releaseBooking, endUsage, releaseIdleHalf } from '../store'
 import {
   SURFACE_META, HOOP_META, bookingsOfHalf, checkedInCount, courtRisk,
-  fmt, halfSealed, isActive, timeState
+  fmt, halfSealed, isActive, timeState, underfillView, boundaryConfirmed, money
 } from '../lib/engine'
+import { lightLive } from '../store'
 import type { Booking, Court } from '../types'
 import RiskTag from '../components/RiskTag.vue'
 import RuleLink from '../components/RuleLink.vue'
@@ -45,6 +46,16 @@ function remainBig(b: Booking) {
 
 function release(b: Booking) { releaseBooking(b.id) }
 function forceEnd(b: Booking) { endUsage(b.id, true) }
+function releaseHalf(b: Booking) { releaseIdleHalf(b.id) }
+
+// 全场人数不足
+function uf(b: Booking) { return underfillView(b, state.mergeRequests, nowStr.value) }
+/** 释放后与该半场共用场地的对组 */
+function pairBooking(b: Booking): Booking | undefined {
+  if (b.underfill?.stage !== 'released') return undefined
+  return state.bookings.find(x => x.id === (b.splitFromId ?? b.underfill?.walkerBookingId))
+}
+function liveFee(b: Booking) { return lightLive(b)?.fee ?? 0 }
 </script>
 
 <template>
@@ -105,6 +116,48 @@ function forceEnd(b: Booking) { endUsage(b.id, true) }
             <NButton v-if="state.role === 'admin'" size="tiny" type="error" round style="margin-left:6px"
               @click="release(currentOf(c, h)!)">释放场地</NButton>
             <RuleLink id="R-FAIR-2" />
+          </div>
+
+          <!-- 全场人数不足自动调整（R-MERGE-2） -->
+          <template v-if="currentOf(c, h)!.underfill && h === currentOf(c, h)!.halves[currentOf(c, h)!.halves.length - 1]">
+            <!-- 队长选择中 / 超保留时间 -->
+            <div v-if="currentOf(c, h)!.underfill?.stage === 'prompted'" class="hr-underfill">
+              🧩 全场仅 {{ checkedInCount(currentOf(c, h)!) }} 人、{{ uf(currentOf(c, h)!)?.waitingPeople ?? 0 }} 名散客等待，
+              队长保留至 {{ currentOf(c, h)!.underfill?.decideDeadline }}
+              <template v-if="(uf(currentOf(c, h)!)?.keepRemaining ?? 0) <= 0">
+                · <span style="color:#d03050;font-weight:700">已超时</span>
+                <NButton v-if="state.role === 'admin'" size="tiny" type="warning" round style="margin-left:6px"
+                  @click="releaseHalf(currentOf(c, h)!)">释放空闲半场</NButton>
+              </template>
+              <RuleLink id="R-MERGE-2" />
+            </div>
+            <!-- 队长已降半场待释放 -->
+            <div v-else-if="currentOf(c, h)!.underfill?.stage === 'downgrade'" class="hr-underfill">
+              📉 队长已降半场，空闲半场 {{ currentOf(c, h)!.underfill?.releasedHalf }} 待释放
+              <NButton v-if="state.role === 'admin'" size="tiny" type="warning" round style="margin-left:6px"
+                @click="releaseHalf(currentOf(c, h)!)">释放给候补散客</NButton>
+            </div>
+          </template>
+          <!-- 释放后：中线边界 / 照明分摊 / 结束提醒 / 双方确认 -->
+          <div v-if="pairBooking(currentOf(c, h)!)" class="hr-boundary">
+            <div class="hb-line">
+              🧭 中线分界：本侧 {{ currentOf(c, h)!.halves[0] }}
+              <b>{{ currentOf(c, h)!.isWalkerAllocation ? '候补散客' : '原预约队' }}</b>
+              ｜对侧 {{ pairBooking(currentOf(c, h)!)!.halves[0] }}
+              <b>{{ currentOf(c, h)!.isWalkerAllocation ? '原预约队' : '候补散客' }}</b>
+            </div>
+            <div class="hb-line">💡 照明各按各半场计：本侧 ¥{{ money(liveFee(currentOf(c, h)!)) }} ｜对侧 ¥{{ money(liveFee(pairBooking(currentOf(c, h)!)!)) }}（8 折按签到人数平摊）</div>
+            <div class="hb-line">⏰ {{ currentOf(c, h)!.end }} 同步结束，结束前 5 分钟提醒清场关灯
+              <NTag size="tiny" :type="currentOf(c, h)!.underfill?.endReminded ? 'warning' : 'default'" round style="margin-left:4px">
+                {{ currentOf(c, h)!.underfill?.endReminded ? '已推送结束提醒' : '待提醒' }}
+              </NTag>
+            </div>
+            <div class="hb-line">
+              ✅ 边界确认：
+              <NTag size="tiny" :type="currentOf(c, h)!.underfill?.confirmedByTeam ? 'success' : 'warning'">原队{{ currentOf(c, h)!.underfill?.confirmedByTeam ? '✓' : '待确认' }}</NTag>
+              <NTag size="tiny" :type="currentOf(c, h)!.underfill?.confirmedByWalker ? 'success' : 'warning'">散客{{ currentOf(c, h)!.underfill?.confirmedByWalker ? '✓' : '待确认' }}</NTag>
+              <NTag v-if="boundaryConfirmed(currentOf(c, h)!)" size="tiny" type="success" round>双方已确认·防争抢</NTag>
+            </div>
           </div>
           <div v-if="timeState(currentOf(c, h)!, nowStr).forceClearable" class="hr-release">
             🚨 超时超 15 分钟，管理员可强制清场并暂停其预约资格 7 天
@@ -169,6 +222,9 @@ function forceEnd(b: Booking) { endUsage(b.id, true) }
 .hr-off { font-weight:700; color:#d03050; font-size:14px; }
 .hr-rule { font-size:12px; color:#999; margin-top:2px; }
 .hr-release { background:#fff7e6; border-radius:6px; padding:4px 6px; font-size:12px; color:#ad6800; margin-top:6px; display:flex; align-items:center; flex-wrap:wrap; }
+.hr-underfill { background:#fff1f0; border:1px solid #ffccc7; border-radius:6px; padding:5px 7px; font-size:12px; color:#a8271e; margin-top:6px; line-height:1.8; }
+.hr-boundary { background:#f0f7ff; border:1px solid #c6defa; border-radius:6px; padding:5px 7px; font-size:11.5px; color:#28517a; margin-top:6px; line-height:1.9; }
+.hb-line { display:flex; align-items:center; gap:4px; flex-wrap:wrap; }
 .idle .hr-team { color:#18a058; }
 .cb-foot { display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#999; border-top:1px dashed #eee; padding-top:6px; }
 .dispute-guide { background:#fff; border-radius:12px; padding:12px; box-shadow:0 1px 4px rgba(0,0,0,.06); font-size:12px; line-height:2; }

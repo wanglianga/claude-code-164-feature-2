@@ -5,11 +5,12 @@ import {
   NRadioGroup, NRadio, NForm, NFormItem, useMessage
 } from 'naive-ui'
 import {
-  useState, nowStr, releaseBooking, endUsage, setSurface, adminReschedule
+  useState, nowStr, releaseBooking, endUsage, setSurface, adminReschedule,
+  releaseIdleHalf
 } from '../store'
 import {
   STATUS_META, PAY_META, bookingRisk, checkedInCount, hm, isActive, money,
-  feeSummary, timeState
+  feeSummary, timeState, underfillView, boundaryConfirmed
 } from '../lib/engine'
 import type { Booking, SurfaceStatus } from '../types'
 import RiskTag from '../components/RiskTag.vue'
@@ -53,6 +54,25 @@ const totals = computed(() => {
     }, 0)
   }
 })
+
+function doReleaseHalf(b: Booking) {
+  releaseIdleHalf(b.id)
+  message.success('空闲半场已释放给候补散客，边界/照明/结束提醒已重新生成')
+}
+function ufOf(b: Booking) { return underfillView(b, state.mergeRequests, nowStr.value) }
+/** 超保留时间（全场 prompted 超时）或队长已主动降半场待分配 → 管理员可释放空闲半场 */
+function canReleaseHalf(b: Booking) {
+  const v = ufOf(b)
+  if (!v) return false
+  if (b.scope === 'full' && v.releaseable) return true
+  if (b.underfill?.stage === 'downgrade' && !b.underfill.walkerBookingId) return true
+  return false
+}
+function pairOf(b: Booking) {
+  if (b.underfill?.stage !== 'released') return null
+  const other = state.bookings.find(x => x.id === (b.splitFromId ?? b.underfill?.walkerBookingId))
+  return other ?? null
+}
 
 // 场地控制
 const surfaceTarget = ref<string>('')
@@ -154,9 +174,35 @@ const fairness = computed(() => {
             · <span style="color:#d03050">超时 {{ timeState(b, nowStr).overtimeMinutes }} 分钟</span>
           </template>
         </div>
+        <div v-if="b.underfill" class="ar-underfill">
+          <template v-if="b.underfill.stage === 'prompted'">
+            🧩 全场人数不足调整中：实际到场 {{ checkedInCount(b) }} 人，候补 {{ ufOf(b)?.waitingPeople ?? 0 }} 人，
+            队长保留至 <b>{{ b.underfill.decideDeadline }}</b>
+            <span v-if="(ufOf(b)?.keepRemaining ?? 0) > 0">（剩 {{ ufOf(b)?.keepRemaining }} 分钟）</span>
+            <span v-else style="color:#d03050;font-weight:700">· 已超保留时间</span>
+          </template>
+          <template v-else-if="b.underfill.stage === 'downgrade'">
+            📉 队长已降为半场 {{ b.halves.join('') }}，空闲半场 {{ b.underfill.releasedHalf }} 待释放给候补散客
+          </template>
+          <template v-else-if="b.underfill.stage === 'merge'">✅ 队长已接受拼场，候补散客并入共用全场</template>
+          <template v-else-if="b.underfill.stage === 'keep'">💰 队长已补缴全场保留费，继续独占全场（已答复候补）</template>
+          <template v-else-if="b.underfill.stage === 'released'">
+            🧭 已释放 {{ b.underfill.releasedHalf }} 给候补散客（{{ pairOf(b)?.teamName ?? '' }}）：
+            边界确认
+            <b :style="{ color: b.underfill.confirmedByTeam ? '#18a058' : '#f0a020' }">原队{{ b.underfill.confirmedByTeam ? '✓' : '…' }}</b> /
+            <b :style="{ color: b.underfill.confirmedByWalker ? '#18a058' : '#f0a020' }">散客{{ b.underfill.confirmedByWalker ? '✓' : '…' }}</b>
+            <NTag v-if="boundaryConfirmed(b)" size="tiny" type="success" round style="margin-left:4px">双方已确认</NTag>
+          </template>
+        </div>
         <div class="ar-actions">
           <NButton v-if="b.status === 'booked' && timeState(b, nowStr).releasable" size="tiny" type="error" ghost round
             @click="releaseBooking(b.id)">释放（爽约处理）</NButton>
+          <NPopconfirm v-if="canReleaseHalf(b)" @positive-click="doReleaseHalf(b)">
+            <template #trigger>
+              <NButton size="tiny" type="warning" round>释放空闲半场给候补散客</NButton>
+            </template>
+            释放后系统重新划定两组中线边界、各自照明分摊与结束提醒，并推送双方确认（R-MERGE-2）。
+          </NPopconfirm>
           <NPopconfirm v-if="isActive(b, nowStr)" @positive-click="endUsage(b.id, true)">
             <template #trigger><NButton size="tiny" type="error" ghost round>强制结束并结算</NButton></template>
             将按实际时长结算照明费并关灯
@@ -263,6 +309,7 @@ const fairness = computed(() => {
 .ar-meta { font-size:12px; color:#888; margin:3px 0; }
 .ar-chips { display:flex; gap:4px; flex-wrap:wrap; margin:4px 0; }
 .ar-live { font-size:12px; color:#666; background:#f7f9fc; border-radius:6px; padding:5px 7px; margin-top:4px; }
+.ar-underfill { font-size:12px; color:#8a5a00; background:#fff7e6; border:1px solid #ffe7ba; border-radius:6px; padding:5px 7px; margin-top:4px; line-height:1.7; }
 .ar-actions { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
 .fair-box { background:linear-gradient(135deg,#f0f7ff,#f7f0ff); border-radius:12px; padding:12px; margin-bottom:12px; font-size:12px; line-height:1.9; }
 .fb-title { font-weight:700; font-size:13px; margin-bottom:6px; }

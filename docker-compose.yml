@@ -1,0 +1,11 @@
+services:
+  court-booking:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: court-booking:latest
+    container_name: court-booking
+    ports:
+      # 宿主机 8080 → 容器 80
+      - "8080:80"
+    restart: unless-stopped

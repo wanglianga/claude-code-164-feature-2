@@ -454,6 +454,52 @@ export const BOOKINGS: Booking[] = [
       { at: '15:20', text: '队长点击"结束使用并关灯"，按实际 50 分钟结算', tone: 'success' },
       { at: '15:22', text: '押金 50 元扣除照明 40 元，退回 10 元（1–3 工作日到账）', tone: 'success' }
     ]
+  },
+  {
+    // 全场人数不足自动调整演示场次（R-MERGE-2）：预约全场 H3+H4，实际仅 4 人到场，散客组在场边等待
+    id: 'B011',
+    code: '728456',
+    courtId: 'court-3',
+    halves: ['H3', 'H4'],
+    scope: 'full',
+    date: TODAY,
+    start: '19:00',
+    end: '21:00',
+    actualStart: '19:02',
+    headcount: 4,
+    acceptMerge: false,
+    teamName: '苍狼队',
+    captainId: 'u-qin',
+    captainName: '秦勇',
+    captainPhone: '135****3320',
+    fixedTeam: false,
+    credit: 88,
+    status: 'ongoing',
+    payStatus: 'depositPaid',
+    checkInCode: '728456',
+    lockerNos: [20],
+    lighting: { enabled: true, onAt: '19:03', minutes: 0, fee: 0, deposit: 100 },
+    fees: [
+      { kind: 'lighting', label: '照明费（全场 ×2 半场，实时累计）', amount: 0, ruleId: 'R-LIGHT-1' }
+    ],
+    members: [
+      { id: 'm11-1', name: '秦勇', phone: '135****3320', isCaptain: true, checkedIn: true, checkInAt: '19:02' },
+      { id: 'm11-2', name: '许峰', phone: '135****3321', isCaptain: false, checkedIn: true, checkInAt: '19:03' },
+      { id: 'm11-3', name: '何冰', phone: '135****3322', isCaptain: false, checkedIn: true, checkInAt: '19:05' },
+      { id: 'm11-4', name: '吕鹏', phone: '135****3323', isCaptain: false, checkedIn: true, checkInAt: '19:06' }
+    ],
+    underfill: {
+      stage: 'prompted',
+      promptedAt: '19:40',
+      decideDeadline: '19:50',
+      waitingRequestIds: ['MR-4']
+    },
+    timeline: [
+      { at: '17:05', text: '预约成功：河滨公园灯光球场 H3+H4 全场 19:00–21:00，预付全场照明押金 100 元', tone: 'success' },
+      { at: '19:02', text: '队长秦勇到场签到，照明 19:03 开启，按全场 2 个半场计费', tone: 'info' },
+      { at: '19:38', text: '现场 4 人散客组（王同学等）在 H3 边线排队候补，请求加入或使用空闲半场', tone: 'warning' },
+      { at: '19:40', text: '系统检测到全场仅 4 人签到（<6 人）且有散客等待：发起人数不足调整提示，请在 19:50 前选择接受拼场 / 降为半场 / 补缴全场差额（R-MERGE-2）', tone: 'warning' }
+    ]
   }
 ]
 
@@ -551,6 +597,23 @@ export const INCIDENTS: Incident[] = [
     actions: [
       { at: '19:30', by: 'worker', text: '林芳录入街道通知并通知管理员审核' }
     ]
+  },
+  {
+    // 全场人数不足·候补散客异议工单（R-MERGE-2）
+    id: 'I-007',
+    type: 'underfill',
+    courtId: 'court-3',
+    bookingIds: ['B011'],
+    title: '全场仅 4 人使用，4 人散客组请求拼场/释放 H4',
+    desc: '苍狼队预约河滨公园灯光球场 H3+H4 全场（19:00–21:00），19:02 开场后实际仅 4 人签到，H4 半场持续空置。王同学等 4 名散客在 H3 边线等待，已提交拼场申请（MR-4）并现场登记异议：请求队长接受拼场，或在超保留时间后由管理员释放 H4。队长选择保留时限至 19:50。',
+    source: '候补散客 王同学（150****3321）现场登记',
+    time: '19:38',
+    status: 'mediating',
+    actions: [
+      { at: '19:38', by: 'walkin', text: '王同学现场登记排队候补号 W-07，并提交拼场申请 MR-4' },
+      { at: '19:40', by: 'admin', text: '系统向队长秦勇发起人数不足调整提示（拼场 / 降为半场 / 补缴全场保留费），保留时限 10 分钟至 19:50（R-MERGE-2）' },
+      { at: '19:41', by: 'worker', text: '林芳到场维持 H3 边线候补秩序，告知散客：超 19:50 队长未选择，管理员可释放 H4，处置结果将在本工单答复' }
+    ]
   }
 ]
 
@@ -585,5 +648,16 @@ export const MERGE_REQUESTS: MergeRequest[] = [
     status: 'rejected',
     unreasonable: true,
     time: '17:52'
+  },
+  {
+    // 全场人数不足场景：4 人散客组在 H3/H4 场边等待（R-MERGE-2）
+    id: 'MR-4',
+    bookingId: 'B011',
+    walkerName: '王同学',
+    walkerPhone: '150****3321',
+    people: 4,
+    message: '我们 4 个人都在 H3 边线，看到对面 H4 一直空着，求拼场或者把 H4 让给我们，谢谢队长！',
+    status: 'pending',
+    time: '19:38'
   }
 ]

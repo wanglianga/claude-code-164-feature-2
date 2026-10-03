@@ -7,9 +7,9 @@ import {
 import {
   useState, nowStr,
   resolveLightFault, resolveNoise, resolveMinor, issueSealOrder,
-  ruleDispute, addIncidentAction, setIncidentStatus
+  ruleDispute, addIncidentAction, setIncidentStatus, releaseIdleHalf
 } from '../store'
-import { INCIDENT_META } from '../lib/engine'
+import { INCIDENT_META, underfillView, boundaryConfirmed, checkedInCount } from '../lib/engine'
 import type { Incident, IncidentStatus, RoleId } from '../types'
 import RuleLink from '../components/RuleLink.vue'
 import { incidentFilter } from '../lib/ui'
@@ -91,6 +91,30 @@ function doRule(inc: Incident) {
   if (!text) return message.warning('请填写裁决结论')
   ruleDispute(inc.id, text)
   message.success('裁决已记录并同步双方')
+}
+
+// 全场人数不足（R-MERGE-2）
+function underfillBooking(inc: Incident) {
+  // 原全场/半场预约（非散客派生）
+  return state.bookings.find(b => inc.bookingIds.includes(b.id) && !b.isWalkerAllocation)
+}
+function ufMeta(inc: Incident) {
+  const b = underfillBooking(inc)
+  if (!b) return null
+  return { b, view: underfillView(b, state.mergeRequests, nowStr.value) }
+}
+function doReleaseHalf(inc: Incident) {
+  const b = underfillBooking(inc)
+  if (!b) return
+  releaseIdleHalf(b.id)
+  message.success('空闲半场已释放，边界/照明/结束提醒已重新生成，等待双方确认')
+}
+function canReleaseUnderfill(inc: Incident) {
+  const m = ufMeta(inc)
+  if (!m) return false
+  const b = m.b
+  if (b.underfill?.stage === 'downgrade' && !b.underfill.walkerBookingId) return true
+  return b.scope === 'full' && !!m.view?.releaseable
 }
 
 const typeOptions = [
@@ -217,6 +241,65 @@ const typeOptions = [
             </div>
           </template>
           <div v-else class="handle-title">社区工作人员可先劝导稳控，篮筐归属由管理员裁决。</div>
+        </template>
+
+        <!-- 全场人数不足（R-MERGE-2） -->
+        <template v-else-if="inc.type === 'underfill'">
+          <template v-if="ufMeta(inc)">
+            <div class="handle-title">
+              🧩 全场人数不足处置（R-MERGE-2）：预约方实际到场
+              <b style="color:#d03050">{{ checkedInCount(ufMeta(inc)!.b) }} 人</b>，候补
+              <b>{{ ufMeta(inc)!.view?.waitingPeople ?? 0 }} 人</b>。
+              队长三选一（接受拼场 / 降半场退差额 / 补缴保留费），超保留时间未选可释放空闲半场。
+            </div>
+            <!-- 队长选择中 -->
+            <template v-if="ufMeta(inc)!.b.underfill?.stage === 'prompted'">
+              <div class="handle-title" style="color:#a06a00">
+                队长保留截止 {{ ufMeta(inc)!.b.underfill?.decideDeadline }}
+                <template v-if="(ufMeta(inc)!.view?.keepRemaining ?? 0) > 0">（剩 {{ ufMeta(inc)!.view?.keepRemaining }} 分钟）</template>
+                <template v-else>——已超过保留时间，可释放</template>
+              </div>
+              <div class="handle-btns">
+                <NButton v-if="isAdmin" size="small" type="warning" round :disabled="!canReleaseUnderfill(inc)"
+                  @click="doReleaseHalf(inc)">释放空闲半场给候补散客</NButton>
+                <span v-else class="handle-title" style="margin:0">空闲半场释放由管理员操作，请通知管理员老周。</span>
+              </div>
+              <div v-if="!canReleaseUnderfill(inc)" style="font-size:11px;color:#999;margin-top:4px">
+                保留时间内由队长在「我的队伍」自行三选一；超时后此按钮才可用。
+              </div>
+            </template>
+            <!-- 已降半场待释放 -->
+            <template v-else-if="ufMeta(inc)!.b.underfill?.stage === 'downgrade'">
+              <div class="handle-title">队长已降半场，空闲半场 {{ ufMeta(inc)!.b.underfill?.releasedHalf }} 待分配：</div>
+              <div class="handle-btns">
+                <NButton size="small" type="warning" round @click="doReleaseHalf(inc)">立即释放给候补散客</NButton>
+              </div>
+            </template>
+            <!-- 已释放：双方确认进度 -->
+            <template v-else-if="ufMeta(inc)!.b.underfill?.stage === 'released'">
+              <div class="handle-title">已重新划定中线边界、照明分摊与结束提醒，等待双方确认（避免拼场后争抢）：</div>
+              <div class="handle-btns" style="align-items:center">
+                <NTag size="small" :type="ufMeta(inc)!.b.underfill?.confirmedByTeam ? 'success' : 'warning'">
+                  原队{{ ufMeta(inc)!.b.underfill?.confirmedByTeam ? '已确认 ✓' : '待确认' }}
+                </NTag>
+                <NTag size="small" :type="ufMeta(inc)!.b.underfill?.confirmedByWalker ? 'success' : 'warning'">
+                  散客{{ ufMeta(inc)!.b.underfill?.confirmedByWalker ? '已确认 ✓' : '待确认' }}
+                </NTag>
+                <NTag v-if="boundaryConfirmed(ufMeta(inc)!.b)" size="small" type="success" round>双方均已确认，可办结</NTag>
+              </div>
+              <div v-if="!boundaryConfirmed(ufMeta(inc)!.b)" style="font-size:11px;color:#999;margin-top:4px">
+                双方在各自页面（队长「我的队伍」/ 散客「拼场签到」）点确认后，工单自动办结；越界占用按争抢处理（R-DISPUTE-1）。
+              </div>
+            </template>
+            <!-- 已拼场 / 已补缴 -->
+            <template v-else>
+              <div class="handle-title">
+                {{ ufMeta(inc)!.b.underfill?.stage === 'merge' ? '队长已接受拼场，双方共用全场，异议已解决。' : '队长已补缴全场保留费，已答复候补散客。' }}
+                可在下方补充答复后办结。
+              </div>
+            </template>
+          </template>
+          <div v-else class="handle-title">该工单关联预约未找到，请核对记录。</div>
         </template>
 
         <!-- 下雨/维修：核验记录 -->

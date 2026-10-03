@@ -85,6 +85,8 @@ export interface LightingUsage {
   minutes: number
   fee: number
   deposit: number
+  /** 降为半场/释放分割后，照明从此刻起按新范围重新计量（之前费用已固化） */
+  meterFrom?: string
 }
 
 export type FeeItemKind =
@@ -98,6 +100,8 @@ export type FeeItemKind =
   | 'complaint'    // 噪声投诉处罚
   | 'sealRefund'   // 封场全额退款
   | 'reschedule'   // 改约补偿
+  | 'fullKeep'     // 全场保留费（拒绝调整仍包全场）
+  | 'downgradeRefund' // 降为半场·全场押金差额退还
 
 export interface FeeItem {
   kind: FeeItemKind
@@ -105,6 +109,8 @@ export interface FeeItem {
   amount: number   // 正=收取，负=退还/抵扣
   ruleId: string
   note?: string
+  /** 已固化的历史费用（如释放半场前的全场照明），结算时不被实时照明重算覆盖 */
+  locked?: boolean
 }
 
 export type IncidentType =
@@ -118,6 +124,7 @@ export type IncidentType =
   | 'late'            // 队伍迟到
   | 'overtime'        // 超时占用
   | 'refuseMerge'    // 拒绝拼场
+  | 'underfill'       // 全场人数不足·候补散客异议
 
 export type IncidentStatus = 'open' | 'mediating' | 'resolved' | 'penalized'
 
@@ -158,6 +165,33 @@ export interface MergeRequest {
   /** 队长拒绝是否被判为"无正当理由拒拼" */
   unreasonable?: boolean
   time: string
+  /** 释放空闲半场后，该候补被当场分配到的新预约 id */
+  reallocatedTo?: string
+}
+
+/** 全场人数不足时的自动调整记录（R-MERGE-2） */
+export interface UnderfillAdjustment {
+  /** prompted=已发起等待队长选择；merge=已接受拼场；downgrade=已降为半场；keep=已补缴保留全场；released=空闲半场已释放 */
+  stage: 'prompted' | 'merge' | 'downgrade' | 'keep' | 'released'
+  /** 发起提示时间 HH:mm（开场即检测，开场 10 分钟内选择） */
+  promptedAt: string
+  /** 保留截止时间 HH:mm（超过后管理员可释放空闲半场） */
+  decideDeadline: string
+  /** 已在等待的候补申请 id */
+  waitingRequestIds: string[]
+  /** 释放的空闲半场编号 */
+  releasedHalf?: string
+  /** 释放后在空闲半场新建的散客半场预约 id */
+  walkerBookingId?: string
+  /** 场地中线分隔确认：原队/散客是否已确认边界与照明分摊 */
+  confirmedByTeam?: boolean
+  confirmedByWalker?: boolean
+  /** 保留截止前是否已催办队长 */
+  reminded?: boolean
+  /** 结束前 5 分钟是否已推送清场提醒 */
+  endReminded?: boolean
+  /** 队长的选择说明 */
+  note?: string
 }
 
 export interface Booking {
@@ -195,6 +229,12 @@ export interface Booking {
   /** 签到码 */
   checkInCode: string
   lockerNos?: number[]
+  /** 全场人数不足的自动调整记录（R-MERGE-2） */
+  underfill?: UnderfillAdjustment
+  /** 释放空闲半场后派生的散客半场预约：来源全场预约 id */
+  splitFromId?: string
+  /** 释放半场派生预约：由管理员当场分配给候补散客 */
+  isWalkerAllocation?: boolean
 }
 
 export interface TimelineEvent {

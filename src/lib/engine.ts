@@ -67,7 +67,8 @@ export const INCIDENT_META: Record<IncidentType, { label: string; emoji: string 
   seal: { label: '封场', emoji: '🚧' },
   late: { label: '队伍迟到', emoji: '⏰' },
   overtime: { label: '超时占用', emoji: '⌛' },
-  refuseMerge: { label: '拒绝拼场', emoji: '🚫' }
+  refuseMerge: { label: '拒绝拼场', emoji: '🚫' },
+  underfill: { label: '全场人数不足', emoji: '🧩' }
 }
 
 export const FEE_META: Record<string, { label: string; type: 'success' | 'warning' | 'error' | 'info' | 'default' }> = {
@@ -80,8 +81,21 @@ export const FEE_META: Record<string, { label: string; type: 'success' | 'warnin
   weather: { label: '天气补偿', type: 'success' },
   complaint: { label: '噪声处罚', type: 'error' },
   sealRefund: { label: '封场退款', type: 'success' },
-  reschedule: { label: '改约补偿', type: 'success' }
+  reschedule: { label: '改约补偿', type: 'success' },
+  fullKeep: { label: '全场保留费', type: 'warning' },
+  downgradeRefund: { label: '降半场退还押金差额', type: 'success' }
 }
+
+// ---------- 全场人数不足自动调整（R-MERGE-2） ----------
+/** 全场实际签到低于该人数即触发调整提示 */
+export const UNDERFILL_LIMIT = 6
+/** 队长保留选择时间（分钟），超时管理员可释放空闲半场 */
+export const UNDERFILL_KEEP_MINUTES = 10
+/** 选择继续独占全场需补缴的全场保留费 */
+export const FULL_KEEP_FEE = 30
+/** 全场 / 半场照明押金 */
+export const FULL_DEPOSIT = 100
+export const HALF_DEPOSIT = 50
 
 // ---------- 照明实时计费 ----------
 export interface LightQuote {
@@ -98,8 +112,10 @@ export interface LightQuote {
 
 export function lightQuote(b: Booking, court: Court | undefined, nowHm: string, frozen = false): LightQuote | null {
   if (!b.lighting.enabled || !court || !b.lighting.onAt) return null
+  // 降半场/释放分割后，实时照明从 meterFrom 起按当前 scope 重新计量（之前费用已固化）
+  const onAt = b.lighting.meterFrom ?? b.lighting.onAt
   const endOf = b.lighting.offAt ?? (isActive(b, nowHm) ? nowHm : (b.actualEnd ?? b.end))
-  const minutes = Math.max(0, hm(endOf) - hm(b.lighting.onAt))
+  const minutes = Math.max(0, hm(endOf) - hm(onAt))
   const halfFactor = b.scope === 'full' ? 2 : 1
   const gross = minutes * court.lighting.pricePerMinute * halfFactor
   const rate = b.acceptMerge ? 0.8 : 1
@@ -192,7 +208,8 @@ export function feeSummary(b: Booking, court: Court | undefined, nowHm: string, 
   const lf = lateFee(b, nowHm)
   const of = overtimeFee(b, nowHm)
   for (const f of b.fees) {
-    if (f.kind === 'lighting') continue // 照明实时计算
+    // 实时照明条目跳过（金额实时另算）；已固化的历史照明费（半场释放前全场部分）保留
+    if (f.kind === 'lighting' && !f.locked) continue
     items.push(f)
   }
   if (lf > 0 && !b.fees.some(f => f.kind === 'late')) {
@@ -235,6 +252,18 @@ export function bookingRisk(b: Booking, incidents: Incident[], nowHm: string): R
   if (b.status === 'booked' && ts.lateMinutes > 0 && ts.lateMinutes < 20) raise('medium', `已迟到 ${ts.lateMinutes} 分钟`)
   if (b.credit < 80) raise('medium', `信用分 ${b.credit}（低于 80，冲突排序靠后）`)
   if (b.credit < 60) raise('high', `信用分 ${b.credit}（低于 60，应暂停预约资格）`)
+
+  // 全场人数不足自动调整（R-MERGE-2）
+  if (b.scope === 'full' && b.underfill) {
+    const u = b.underfill
+    if (u.stage === 'prompted') {
+      const left = hm(u.decideDeadline) - hm(nowHm)
+      if (left <= 0) raise('high', '队长超保留时间未选择调整方式，管理员可释放空闲半场给候补散客（R-MERGE-2）')
+      else raise('medium', `全场仅 ${checkedInCount(b)} 人到场，等待队长选择拼场/降半场/补缴（剩 ${left} 分钟，R-MERGE-2）`)
+    } else if (u.stage === 'released' && !boundaryConfirmed(b)) {
+      raise('medium', '空闲半场已释放给散客，中线边界/照明分摊待双方确认，越界按争抢处理（R-MERGE-2）')
+    }
+  }
 
   for (const inc of incidents) {
     if (!inc.bookingIds.includes(b.id) || !ACTIVE_INCIDENT.includes(inc.status)) continue
@@ -360,4 +389,87 @@ export function rejectMergeCheck(b: Booking, req: MergeRequest): { unreasonable:
   }
   if (total >= 6) return { unreasonable: true, hint: '拼入后达到半场合理人数（≥6 人），无理由拒绝将收 20 元资源占用费并扣信用 5 分（R-MERGE-1）' }
   return { unreasonable: false, hint: '当前人数不足，建议同意拼场以提高场地利用率' }
+}
+
+// ---------- 全场人数不足自动调整（R-MERGE-2） ----------
+export interface UnderfillView {
+  /** 实际签到人数 */
+  present: number
+  /** 是否达到触发条件（全场、进行中、签到不足、尚未进入调整流程） */
+  shouldPrompt: boolean
+  /** 等待加入的候补申请 */
+  waiting: MergeRequest[]
+  /** 候补总人数 */
+  waitingPeople: number
+  /** 已发起调整时，距保留截止还剩多少分钟（负=已超时，管理员可释放） */
+  keepRemaining: number
+  /** 管理员是否可释放空闲半场 */
+  releaseable: boolean
+  /** 降半场应退押金差额 */
+  depositDiff: number
+  /** 保留全场需补缴金额 */
+  keepFee: number
+}
+
+export function underfillView(
+  b: Booking,
+  requests: MergeRequest[],
+  nowHm: string
+): UnderfillView | null {
+  const present = checkedInCount(b)
+  const waitingIds = b.underfill?.waitingRequestIds
+  const waiting = waitingIds?.length
+    ? requests.filter(r => waitingIds.includes(r.id) && r.status === 'pending')
+    : requests.filter(r => r.bookingId === b.id && r.status === 'pending')
+  const depositDiff = Math.max(0, (b.lighting.deposit || FULL_DEPOSIT) - HALF_DEPOSIT)
+  const keepRemaining = b.underfill
+    ? hm(b.underfill.decideDeadline) - hm(nowHm)
+    : UNDERFILL_KEEP_MINUTES
+  const prompted = b.underfill?.stage === 'prompted'
+
+  // 已进入调整流程（含已降半场/已释放）：继续返回视图供释放与确认展示
+  if (b.underfill) {
+    return {
+      present,
+      shouldPrompt: false,
+      waiting,
+      waitingPeople: waiting.reduce((s, r) => s + r.people, 0),
+      keepRemaining,
+      releaseable: b.scope === 'full' && prompted && keepRemaining <= 0,
+      depositDiff,
+      keepFee: FULL_KEEP_FEE
+    }
+  }
+  if (b.scope !== 'full' || !isActive(b, nowHm)) return null
+  return {
+    present,
+    shouldPrompt: present < UNDERFILL_LIMIT && waiting.length > 0,
+    waiting,
+    waitingPeople: waiting.reduce((s, r) => s + r.people, 0),
+    keepRemaining,
+    releaseable: false,
+    depositDiff,
+    keepFee: FULL_KEEP_FEE
+  }
+}
+
+/** 释放半场后，与某预约共用同一场地同时段的"边界对组"（原全场队 ↔ 释放半场散客队） */
+export function boundaryPair(
+  b: Booking,
+  bookings: Booking[]
+): { self: Booking; other: Booking } | null {
+  if (!b.underfill || b.underfill.stage !== 'released') return null
+  let other: Booking | undefined
+  if (b.splitFromId) {
+    other = bookings.find(x => x.id === b.splitFromId)
+  } else {
+    other = bookings.find(x => x.splitFromId === b.id)
+  }
+  if (!other || !other.underfill || other.underfill.stage !== 'released') return null
+  return { self: b, other }
+}
+
+/** 双方是否都已确认中线边界（管理员据此防止拼场后争抢） */
+export function boundaryConfirmed(b: Booking): boolean {
+  return !!b.underfill?.confirmedByTeam && !!b.underfill?.confirmedByWalker
 }

@@ -1,0 +1,17 @@
+node_modules
+dist
+.git
+.gitignore
+npm-debug.log*
+*.local
+.DS_Store
+.claude
+.codex
+traces
+recordings
+screenshots
+test-results
+tmp
+temp
+coverage
+*.log

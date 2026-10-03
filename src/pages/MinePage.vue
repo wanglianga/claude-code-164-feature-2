@@ -6,9 +6,13 @@ import {
 } from 'naive-ui'
 import {
   useState, nowStr, addMember, toggleCheckIn, respondMerge,
-  payDeposit, turnOnLight, endUsage, topUp, applyMerge, checkInByCode
+  payDeposit, turnOnLight, endUsage, topUp, applyMerge, checkInByCode,
+  decideUnderfill, confirmBoundary, addUnderfillComplaint
 } from '../store'
-import { checkedInCount, rejectMergeCheck, hm, isActive, timeState } from '../lib/engine'
+import {
+  checkedInCount, rejectMergeCheck, hm, isActive, timeState,
+  underfillView, boundaryConfirmed
+} from '../lib/engine'
 import type { Booking, MergeRequest } from '../types'
 import BookingCard from '../components/BookingCard.vue'
 import BottomSheet from '../components/BottomSheet.vue'
@@ -20,16 +24,26 @@ const message = useMessage()
 const isCaptain = computed(() => state.role === 'captain')
 const isWalkin = computed(() => state.role === 'walkin')
 
-// 队长视角：陈晨（演示）或新建预约（captainId u-me）
+// 队长视角：陈晨（演示）/新建预约，以及需要队长处置或处置中的"全场人数不足"场次（R-MERGE-2）
 const myBookings = computed<Booking[]>(() =>
   state.bookings
-    .filter(b => b.captainName === '陈晨' || b.captainId === 'u-me')
+    .filter(b => b.captainName === '陈晨' || b.captainId === 'u-me' || !!b.underfill)
     .sort((a, b) => hm(b.start) - hm(a.start)))
 
-// 待处理拼场申请
+// 待处理拼场申请（排除已进入"人数不足调整"流程的场次——改由三选一入口处理）
 const pendingRequests = computed<MergeRequest[]>(() =>
   state.mergeRequests.filter(r =>
-    r.status === 'pending' && myBookings.value.some(b => b.id === r.bookingId)))
+    r.status === 'pending' && myBookings.value.some(b => b.id === r.bookingId) &&
+    state.bookings.find(b => b.id === r.bookingId)?.underfill?.stage !== 'prompted'))
+
+// 全场人数不足待选择的场次
+const underfillBookings = computed(() =>
+  myBookings.value.filter(b => b.underfill?.stage === 'prompted'))
+
+// 释放后待本队确认边界的场次
+function needTeamConfirm(b: Booking) {
+  return b.underfill?.stage === 'released' && !b.underfill.confirmedByTeam
+}
 
 // 邀请队员
 const inviteTarget = ref<Booking | null>(null)
@@ -66,6 +80,36 @@ function acceptMergeReq(req: MergeRequest) {
   message.success('已同意拼场，请等待散客到场签到')
 }
 
+// 全场人数不足三选一（R-MERGE-2）
+function choose(b: Booking, choice: 'merge' | 'downgrade' | 'keep') {
+  decideUnderfill(b.id, choice)
+  if (choice === 'merge') message.success('已接受散客拼场，照明 8 折按签到人数平摊')
+  else if (choice === 'downgrade') message.success('已降为半场，押金差额当场退还')
+  else message.success('已收取全场保留费，可继续使用全场')
+}
+function doConfirmTeam(b: Booking) {
+  confirmBoundary(b.id, 'team')
+  message.success('本队已确认中线边界与照明分摊')
+}
+
+// 散客对释放半场的边界确认
+function doConfirmWalker(b: Booking) {
+  confirmBoundary(b.id, 'walker')
+  message.success('散客侧已确认中线边界与照明分摊')
+}
+
+// 散客提交投诉/异议（投诉入口随释放状态更新）
+const complaintTarget = ref<Booking | null>(null)
+const complaintText = ref('')
+function submitComplaint() {
+  if (!complaintTarget.value) return
+  if (!complaintText.value.trim()) return message.warning('请填写异议内容')
+  addUnderfillComplaint(complaintTarget.value.id, complaintText.value.trim())
+  complaintTarget.value = null
+  complaintText.value = ''
+  message.success('异议已提交到工单，社区工作人员 24 小时内答复')
+}
+
 // 照明 / 结算
 function doPay(b: Booking) { payDeposit(b.id); message.success('押金支付成功，到场可开灯') }
 function doLightOn(b: Booking) {
@@ -79,10 +123,10 @@ function doEnd(b: Booking) {
 }
 function doTopUp(b: Booking) { topUp(b.id); message.success('已补缴结清') }
 
-// 散客：找拼场
+// 散客：找拼场（排除已现场分配给自己的释放半场）
 const mergeable = computed(() =>
   state.bookings
-    .filter(b => b.acceptMerge && ['booked', 'ongoing'].includes(b.status))
+    .filter(b => b.acceptMerge && ['booked', 'ongoing'].includes(b.status) && !b.isWalkerAllocation)
     .filter(b => {
       const c = state.courts.find(x => x.id === b.courtId)!
       return !c.sealed && b.members.length < (b.scope === 'full' ? 14 : 8)
@@ -104,6 +148,19 @@ function submitApply() {
 const myApplications = computed(() =>
   state.mergeRequests.filter(r => r.walkerName === '王同学' || r.walkerPhone === applyForm.value.phone))
 
+// 散客视角：已获管理员现场分配的释放半场（R-MERGE-2）
+const myAllocations = computed<Booking[]>(() =>
+  state.bookings
+    .filter(b => b.isWalkerAllocation || b.captainId === 'u-walker')
+    .sort((a, b) => hm(b.start) - hm(a.start)))
+
+// 散客视角：正在候补等待（含队长尚未处理/超时待释放）的全场人数不足场次
+const myWaitingUnderfill = computed(() =>
+  myApplications.value
+    .filter(r => r.status === 'pending')
+    .map(r => state.bookings.find(b => b.id === r.bookingId))
+    .filter((b): b is Booking => !!b && b.scope === 'full'))
+
 // 签到码自助签到
 const codeForm = ref({ code: '', name: '王同学' })
 function doCodeCheckIn() {
@@ -122,6 +179,25 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
     <template v-if="isCaptain">
       <NAlert type="info" :show-icon="false" style="margin-bottom:10px;border-radius:10px">
         <div style="font-size:12px">你是队长：可<b>邀请队员、处理拼场申请、管理签到、开关照明并结算</b>。签到码展示在每张卡片的时间线标题中。</div>
+      </NAlert>
+
+      <!-- 全场人数不足待调整（R-MERGE-2） -->
+      <div v-if="underfillBookings.length" class="section-title">
+        <NBadge :value="underfillBookings.length" type="warning" processing />
+        <span style="margin-left:8px">全场人数不足 · 待选择调整方式</span>
+      </div>
+      <NAlert v-for="b in underfillBookings" :key="'uf-' + b.id" type="warning" style="margin-bottom:10px;border-radius:12px">
+        <div style="font-size:12.5px;line-height:1.8">
+          <b>{{ b.teamName }}</b>（{{ courtName(b.courtId) }} {{ b.halves.join('+') }} 全场）实际仅
+          <b style="color:#d03050">{{ checkedInCount(b) }} 人</b>到场，
+          <b>{{ underfillView(b, state.mergeRequests, nowStr)?.waitingPeople ?? 0 }} 名散客正在等待</b>。
+          请在 <b>{{ b.underfill?.decideDeadline }}</b> 前选择（<RuleLink id="R-MERGE-2" />）：
+        </div>
+        <div class="uf-choices">
+          <NButton size="small" type="primary" round @click="choose(b, 'merge')">① 接受拼场（8 折平摊）</NButton>
+          <NButton size="small" type="success" round @click="choose(b, 'downgrade')">② 降为半场（退 ¥{{ underfillView(b, state.mergeRequests, nowStr)?.depositDiff }} 差额）</NButton>
+          <NButton size="small" type="warning" round @click="choose(b, 'keep')">③ 补缴 ¥{{ underfillView(b, state.mergeRequests, nowStr)?.keepFee }} 保留全场</NButton>
+        </div>
       </NAlert>
 
       <!-- 待处理拼场申请 -->
@@ -162,6 +238,9 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
             <!-- 进行中 / 迟到 / 超时 -->
             <template v-else-if="isActive(b, nowStr)">
               <NButton size="small" round @click="inviteTarget = b">✅ 签到管理（{{ checkedInCount(b) }}/{{ b.members.length }}）</NButton>
+              <NButton v-if="needTeamConfirm(b)" size="small" type="primary" round @click="doConfirmTeam(b)">
+                🧭 确认中线边界/照明分摊
+              </NButton>
               <NPopconfirm @positive-click="doEnd(b)">
                 <template #trigger>
                   <NButton size="small" round type="error" ghost>🔚 结束使用并关灯</NButton>
@@ -201,6 +280,51 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
 
       <div class="section-title">找拼场（{{ mergeable.length }} 场可申请）</div>
       <NEmpty v-if="mergeable.length === 0" description="当前没有可拼的队伍，可去现场排队候补（R-FAIR-2）" />
+
+      <!-- 全场人数不足：候补等待 / 超时待释放 / 投诉入口（R-MERGE-2） -->
+      <template v-for="b in myWaitingUnderfill" :key="'wait-' + b.id">
+        <div class="wait-box">
+          <div class="wt-top">
+            <b>⏳ 正在候补：{{ b.teamName }}（全场 {{ b.halves.join('+') }}）</b>
+            <NTag size="tiny" type="warning">仅 {{ checkedInCount(b) }} 人到场</NTag>
+          </div>
+          <div class="wt-row">
+            {{ courtName(b.courtId) }} · {{ b.start }}–{{ b.end }} · 已提交拼场申请，等待队长选择
+          </div>
+          <div class="wt-row" v-if="b.underfill?.stage === 'prompted'">
+            队长须在 <b>{{ b.underfill.decideDeadline }}</b> 前选择拼场 / 降半场 / 补缴；
+            <template v-if="underfillView(b, state.mergeRequests, nowStr)!.keepRemaining <= 0">
+              <span style="color:#d03050;font-weight:700">已超保留时间</span>，可请管理员释放空闲半场
+            </template>
+            <template v-else>
+              超时未选管理员将释放空闲半场给你所在的候补组
+            </template>
+            <RuleLink id="R-MERGE-2" />
+          </div>
+          <div class="wt-actions">
+            <NButton size="tiny" round type="warning" ghost @click="complaintTarget = b">📣 对处置有异议/投诉</NButton>
+          </div>
+        </div>
+      </template>
+
+      <!-- 已获管理员现场分配的释放半场 -->
+      <template v-for="wb in myAllocations" :key="'alloc-' + wb.id">
+        <BookingCard :booking="wb">
+          <template #actions>
+            <NButton v-if="wb.underfill?.stage === 'released' && !wb.underfill.confirmedByWalker"
+              size="small" type="primary" round @click="doConfirmWalker(wb)">
+              🧭 确认中线边界/照明分摊
+            </NButton>
+            <NTag v-else-if="boundaryConfirmed(wb)" size="small" type="success" round>双方边界已确认</NTag>
+            <NButton size="small" round type="warning" ghost @click="complaintTarget = wb">📣 投诉/异议</NButton>
+            <NPopconfirm @positive-click="doEnd(wb)">
+              <template #trigger><NButton size="small" round type="error" ghost>🔚 结束并关灯结算</NButton></template>
+              结束半场使用并按实际时长结算照明费
+            </NPopconfirm>
+          </template>
+        </BookingCard>
+      </template>
+
       <div v-for="b in mergeable" :key="b.id" class="merge-card">
         <div class="mc-top">
           <b>{{ b.teamName }}</b>
@@ -289,8 +413,7 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
 
     <!-- 散客申请拼场抽屉 -->
     <BottomSheet :show="!!applyTarget" :title="applyTarget ? `申请加入 ${applyTarget.teamName}` : ''"
-      @update:show="v => !v && (applyTarget = null)">
-      <NForm v-if="applyTarget" label-placement="top" size="small">
+      @update:show="v => !v && (applyTarget = null)">      <NForm v-if="applyTarget" label-placement="top" size="small">
         <NFormItem label="称呼">
           <NInput v-model:value="applyForm.name" />
         </NFormItem>
@@ -307,6 +430,17 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
         <NCheckbox v-model:checked="applyForm.minor">同行含未成年人（夜场须监护人陪同）</NCheckbox>
         <NButton type="primary" block round style="margin-top:10px" @click="submitApply">发送申请（队长 10 分钟内处理）</NButton>
       </NForm>
+    </BottomSheet>
+
+    <!-- 散客投诉/异议抽屉（随释放状态同步的投诉入口，R-FAIR-3） -->
+    <BottomSheet :show="!!complaintTarget" title="对处置有异议 · 提交投诉"
+      @update:show="v => !v && (complaintTarget = null)">
+      <NAlert type="warning" style="margin-bottom:10px">
+        候补散客可对全场人数不足的处置（队长拒绝拼场、释放结果、边界划分）提出异议；投诉进入同一工单，社区工作人员 24 小时内书面答复（R-FAIR-3 / R-MERGE-2）。
+      </NAlert>
+      <NInput v-model:value="complaintText" type="textarea" :rows="4"
+        placeholder="请描述异议，如：队长超保留时间仍占着空半场、边界划分影响我们投篮、照明分摊不合理等" />
+      <NButton type="warning" block round style="margin-top:10px" @click="submitComplaint">提交投诉并查看工单</NButton>
     </BottomSheet>
   </div>
 </template>
@@ -326,4 +460,9 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
 .mc-actions { display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap; }
 .invite-box { padding-bottom:10px; }
 .member-line { display:flex; justify-content:space-between; align-items:center; padding:8px 2px; border-bottom:1px solid #f2f2f2; font-size:13px; }
+.uf-choices { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+.wait-box { background:#fff; border:1px solid #ffe7ba; border-radius:12px; padding:10px 12px; margin-bottom:10px; }
+.wt-top { display:flex; justify-content:space-between; align-items:center; gap:6px; font-size:13px; }
+.wt-row { font-size:12px; color:#666; line-height:1.8; margin-top:3px; }
+.wt-actions { margin-top:6px; }
 </style>
