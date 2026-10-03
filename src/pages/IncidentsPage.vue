@@ -7,7 +7,7 @@ import {
 import {
   useState, nowStr,
   resolveLightFault, resolveNoise, resolveMinor, issueSealOrder,
-  ruleDispute, addIncidentAction, setIncidentStatus
+  ruleDispute, addIncidentAction, setIncidentStatus, ruleAdjustAppeal
 } from '../store'
 import { INCIDENT_META } from '../lib/engine'
 import type { Incident, IncidentStatus, RoleId } from '../types'
@@ -91,6 +91,16 @@ function doRule(inc: Incident) {
   if (!text) return message.warning('请填写裁决结论')
   ruleDispute(inc.id, text)
   message.success('裁决已记录并同步双方')
+}
+
+// 释放半场工单（R-MERGE-3 / R-MERGE-4）
+const appealRuling = ref<Record<string, string>>({})
+function doAppealRule(inc: Incident) {
+  const text = (appealRuling.value[inc.id] ?? '').trim()
+  if (!text) return message.warning('请填写复核裁决结论')
+  ruleAdjustAppeal(inc.id, text)
+  appealRuling.value[inc.id] = ''
+  message.success('申诉裁决已同步双方')
 }
 
 const typeOptions = [
@@ -219,6 +229,50 @@ const typeOptions = [
           <div v-else class="handle-title">社区工作人员可先劝导稳控，篮筐归属由管理员裁决。</div>
         </template>
 
+        <!-- 释放半场（全场人数不足） -->
+        <template v-else-if="inc.type === 'halfRelease' || inc.type === 'boundary'">
+          <div class="handle-title">
+            ✂️ {{ inc.type === 'halfRelease' ? '半场释放/缩场' : '拼场后边界争议' }}：费用分段重算、场地边界与双方确认（<RuleLink id="R-MERGE-3" /> <RuleLink id="R-MERGE-4" />）
+          </div>
+          <div v-for="b in linkedBookings(inc)" :key="b!.id" class="rel-booking">
+            <div class="rb-head">
+              <b>{{ b!.releasedFromBookingId ? '散客承接半场' : '原队伍' }} · {{ b!.teamName }}</b>
+              <NTag size="tiny">{{ b!.halves.join('/') }}</NTag>
+            </div>
+            <div v-if="b!.releasedFromBookingId" class="rb-line">
+              承接 {{ b!.start }}–{{ b!.end }} · 照明自付（半场单价，拼场人均摊）· 押金 ¥{{ b!.lighting.deposit }}
+            </div>
+            <template v-else>
+              <div class="rb-line">
+                保留 {{ b!.adjust?.keptHalf }} · 释放 {{ b!.adjust?.freedHalf }}（分界 {{ b!.adjust?.splitAt }}）·
+                信用 {{ b!.credit }}
+              </div>
+              <div class="rb-confirm">
+                <NTag size="tiny" :type="b!.adjust?.confirmedByCaptain ? 'success' : 'warning'">{{ b!.adjust?.confirmedByCaptain ? '队长已确认' : '队长待确认' }}</NTag>
+                <NTag size="tiny" :type="b!.adjust?.confirmedByWalker ? 'success' : 'warning'">{{ b!.adjust?.confirmedByWalker ? '散客已确认' : '散客待确认' }}</NTag>
+              </div>
+            </template>
+          </div>
+
+          <!-- 队长申诉 -->
+          <div v-if="inc.appeal" class="appeal-box">
+            <div class="ab-title">📝 队长申诉（{{ inc.appeal.at }}）：</div>
+            <div class="ab-text">{{ inc.appeal.text }}</div>
+          </div>
+          <template v-if="isAdmin">
+            <template v-if="inc.appeal && !inc.ruling">
+              <NInput v-model:value="appealRuling[inc.id]" type="textarea" :rows="2" size="small"
+                placeholder="复核裁决：如维持释放/撤销释放并退还费用、补偿方案等" style="margin-top:6px" />
+              <div class="handle-btns" style="margin-top:6px">
+                <NButton size="small" type="primary" round @click="doAppealRule(inc)">提交复核裁决并同步双方</NButton>
+              </div>
+            </template>
+            <div v-else-if="inc.ruling" class="ruling-box">✅ 复核裁决：{{ inc.ruling }}</div>
+            <div v-else class="handle-title" style="color:#888">队长暂未申诉；双方确认边界后工单可办结。</div>
+          </template>
+          <div v-else class="handle-title">费用重算与申诉复核由管理员处理；市民可查看处理结论。</div>
+        </template>
+
         <!-- 下雨/维修：核验记录 -->
         <template v-else>
           <div class="handle-title">现场核验记录（适用 <RuleLink :id="inc.type === 'rain' ? 'R-WX-1' : 'R-WX-2'" />）：</div>
@@ -260,6 +314,14 @@ const typeOptions = [
 .seal-inputs { display:flex; gap:6px; flex-wrap:wrap; }
 .note-box { margin-top:8px; }
 .ic-penalty { background:#fff7e6; border-radius:6px; padding:5px 7px; font-size:12px; color:#7a4d00; margin-top:6px; }
+.rel-booking { background:#f7f9fc; border-radius:8px; padding:7px 9px; margin:6px 0; }
+.rb-head { display:flex; justify-content:space-between; align-items:center; font-size:12.5px; }
+.rb-line { font-size:12px; color:#555; line-height:1.7; margin-top:3px; }
+.rb-confirm { display:flex; gap:6px; margin-top:4px; }
+.appeal-box { background:#fffbe6; border:1px solid #ffe58f; border-radius:8px; padding:7px 9px; margin-top:8px; }
+.ab-title { font-size:12px; font-weight:700; color:#7a4d00; }
+.ab-text { font-size:12.5px; line-height:1.7; margin-top:3px; }
+.ruling-box { background:#f0fbf5; border:1px solid #b7ebce; border-radius:8px; padding:7px 9px; font-size:12.5px; color:#1d6b3a; margin-top:6px; }
 .ic-readonly { font-size:12px; color:#999; border-top:1px dashed #eee; padding-top:8px; }
 .tl-item { font-size:12px; line-height:1.9; }
 .tl-at { color:#999; margin-right:6px; }

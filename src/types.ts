@@ -85,6 +85,11 @@ export interface LightingUsage {
   minutes: number
   fee: number
   deposit: number
+  /** 缩场/释放分界时间：此前按全场计，此后该队只按所在半场计 */
+  splitAt?: string
+  /** 分界前的半场系数（全场=2）与折扣率（接受拼场 0.8） */
+  factorBefore?: number
+  rateBefore?: number
 }
 
 export type FeeItemKind =
@@ -98,6 +103,8 @@ export type FeeItemKind =
   | 'complaint'    // 噪声投诉处罚
   | 'sealRefund'   // 封场全额退款
   | 'reschedule'   // 改约补偿
+  | 'surrender'    // 坚持包场（全场人数不足）资源占用费
+  | 'halfAdjust'   // 缩场费用重算退还
 
 export interface FeeItem {
   kind: FeeItemKind
@@ -118,6 +125,8 @@ export type IncidentType =
   | 'late'            // 队伍迟到
   | 'overtime'        // 超时占用
   | 'refuseMerge'    // 拒绝拼场
+  | 'halfRelease'    // 全场人数不足释放半场
+  | 'boundary'       // 拼场后场地边界争议
 
 export type IncidentStatus = 'open' | 'mediating' | 'resolved' | 'penalized'
 
@@ -137,12 +146,69 @@ export interface Incident {
   ruleApplied?: string[]
   /** 后续处罚 */
   penalty?: string
+  /** 队长对释放/缩场的申诉内容 */
+  appeal?: { by: string; at: string; text: string }
+  /** 管理员对申诉的裁决结论 */
+  ruling?: string
 }
 
 export interface IncidentAction {
   at: string
   by: RoleId
   text: string
+}
+
+/**
+ * 全场人数不足时的自动调整（R-MERGE-2 ~ R-MERGE-4）。
+ * 状态机：
+ *   prompting  页面提示队长三选一（接受拼场 / 降为半场 / 补缴全场差额），15 分钟保留期
+ *   rejected   队长拒绝，保留期内不释放；超时后管理员可释放半场
+ *   merging    队长选择接受拼场（候补散客加入同一全场）
+ *   halved     队长主动降为半场，空出半场可分给候补
+ *   surrendered 队长坚持包场并补缴全场差额
+ *   released   队长拒绝且超保留期，管理员释放一个半场给散客
+ *   confirmed  释放/缩场后双方均确认边界，流程闭环
+ */
+export type AdjustStatus =
+  | 'prompting'
+  | 'rejected'
+  | 'merging'
+  | 'halved'
+  | 'surrendered'
+  | 'released'
+  | 'confirmed'
+
+export interface AdjustChoice {
+  /** 队长选择：拼场 / 半场 / 补差额 */
+  choice: 'merge' | 'half' | 'surrender'
+  at: string
+}
+
+export interface HalfAdjust {
+  status: AdjustStatus
+  /** 触发时间（判定人数不足、开始保留期） */
+  promptedAt: string
+  /** 保留期（分钟，默认 15） */
+  holdMinutes: number
+  /** 队长最近一次选择 */
+  decision?: AdjustChoice
+  /** 页面提示的可拼候补申请 id */
+  candidateRequestIds: string[]
+  /** 释放/缩场分界时间（照明分段计费用） */
+  splitAt?: string
+  /** 队长保留的半场；另一个半场被释放给散客 */
+  keptHalf?: string
+  /** 释放出去的半场 */
+  freedHalf?: string
+  /** 承接空半场而新建的散客半场预约 id */
+  releasedBookingId?: string
+  /** 释放半场关联的工单 id（投诉/申诉入口） */
+  incidentId?: string
+  /** 双方是否确认新的场地边界与照明分摊 */
+  confirmedByCaptain?: boolean
+  confirmedByWalker?: boolean
+  /** 队长是否已提交申诉 */
+  appealed?: boolean
 }
 
 /** 拼场申请 */
@@ -154,9 +220,11 @@ export interface MergeRequest {
   people: number
   minor?: boolean
   message: string
-  status: 'pending' | 'accepted' | 'rejected'
+  status: 'pending' | 'accepted' | 'rejected' | 'assigned'
   /** 队长拒绝是否被判为"无正当理由拒拼" */
   unreasonable?: boolean
+  /** 释放半场后，候补散客被分配到的新半场预约 id */
+  assignedBookingId?: string
   time: string
 }
 
@@ -190,6 +258,10 @@ export interface Booking {
   credit: number
   /** 管理员改约/限制原因 */
   adminNote?: string
+  /** 全场人数不足的自动调整流程 */
+  adjust?: HalfAdjust
+  /** 散客半场预约：承接自哪个被释放半场的全场预约 */
+  releasedFromBookingId?: string
   /** 权益/核验时间线 */
   timeline: TimelineEvent[]
   /** 签到码 */

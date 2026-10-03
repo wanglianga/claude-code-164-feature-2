@@ -131,6 +131,13 @@ const progress = computed(() => {
         <span>照明实时累计 <RuleLink id="R-LIGHT-1" /></span>
         <span style="color:#e8840c;font-weight:700">¥{{ money(light.fee) }}</span>
       </div>
+      <div v-if="light && light.segments.length > 1" class="seg-box">
+        <div v-for="(s, i) in light.segments" :key="i" class="seg-line">
+          <span>{{ s.label }}</span>
+          <b>¥{{ money(s.fee) }}</b>
+        </div>
+        <div class="seg-note">分界后按各自所在半场计费（R-MERGE-4），签到人均摊</div>
+      </div>
       <div class="fee-line fee-total">
         <span>当前应计合计 / 押金</span>
         <span :style="{ color: summary.depositBalance < 0 ? '#d03050' : '#18a058', fontWeight: 700 }">
@@ -196,6 +203,9 @@ const progress = computed(() => {
 .fee-line { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:12px; margin:5px 0; }
 .fee-note { color:#999; margin-left:6px; }
 .fee-light-live { color:#e8840c; }
+.seg-box { background:#f7f9fc; border-radius:8px; padding:6px 8px; margin:4px 0; }
+.seg-line { display:flex; justify-content:space-between; font-size:11.5px; color:#555; line-height:1.9; }
+.seg-note { font-size:11px; color:#999; margin-top:2px; }
 .fee-total { border-top:1px solid #f0f0f0; padding-top:6px; margin-top:6px; font-size:13px; }
 .bc-admin-note { background:#fff7e6; border:1px solid #ffe7ba; border-radius:8px; padding:8px; font-size:12px; line-height:1.7; margin-top:8px; color:#7a4d00; }
 .bc-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }

@@ -1,0 +1,9 @@
+node_modules
+dist
+.npmcache
+.git
+.claude
+.codex
+*.log
+npm-debug.log*
+.DS_Store

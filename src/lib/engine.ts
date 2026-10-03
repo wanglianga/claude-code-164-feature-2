@@ -1,6 +1,6 @@
 import type {
   Booking, Court, FeeItem, Incident, IncidentType, IncidentStatus, BookingStatus,
-  MergeRequest, PayStatus, SurfaceStatus, HoopStatus
+  MergeRequest, PayStatus, SurfaceStatus, HoopStatus, AdjustStatus
 } from '../types'
 
 // ---------- 时间工具 ----------
@@ -67,7 +67,9 @@ export const INCIDENT_META: Record<IncidentType, { label: string; emoji: string 
   seal: { label: '封场', emoji: '🚧' },
   late: { label: '队伍迟到', emoji: '⏰' },
   overtime: { label: '超时占用', emoji: '⌛' },
-  refuseMerge: { label: '拒绝拼场', emoji: '🚫' }
+  refuseMerge: { label: '拒绝拼场', emoji: '🚫' },
+  halfRelease: { label: '释放半场', emoji: '✂️' },
+  boundary: { label: '边界争议', emoji: '🚧' }
 }
 
 export const FEE_META: Record<string, { label: string; type: 'success' | 'warning' | 'error' | 'info' | 'default' }> = {
@@ -80,39 +82,87 @@ export const FEE_META: Record<string, { label: string; type: 'success' | 'warnin
   weather: { label: '天气补偿', type: 'success' },
   complaint: { label: '噪声处罚', type: 'error' },
   sealRefund: { label: '封场退款', type: 'success' },
-  reschedule: { label: '改约补偿', type: 'success' }
+  reschedule: { label: '改约补偿', type: 'success' },
+  surrender: { label: '坚持包场差额', type: 'warning' },
+  halfAdjust: { label: '缩场重算退还', type: 'success' }
 }
 
 // ---------- 照明实时计费 ----------
+/** 全场不足触发调整的签到人数阈值（开场 15 分钟后仍不足此数） */
+export const FULL_SHORTAGE_TRIGGER = 6
+/** 队长三选一的保留期（分钟） */
+export const ADJUST_HOLD_MIN = 15
+
+export interface LightSegment {
+  /** 分段说明 */
+  label: string
+  minutes: number
+  /** 半场系数（全场=2，半场=1） */
+  factor: number
+  /** 折扣率（接受拼场 0.8） */
+  rate: number
+  fee: number
+}
+
 export interface LightQuote {
   minutes: number
-  /** 全场 = 2 个半场单价 */
+  /** 等效全场口径的原价（用于展示综合折扣） */
   gross: number
-  /** 勾选接受拼场 8 折（R-BOOK-2 / R-LIGHT-1） */
+  /** 综合折扣率（R-BOOK-2 / R-LIGHT-1）；分段时为加权值 */
   rate: number
   fee: number
   /** 拼场按签到人数平摊 */
   perPerson: number
   frozen: boolean
+  /** 缩场/释放后的分段计费明细 */
+  segments: LightSegment[]
 }
 
 export function lightQuote(b: Booking, court: Court | undefined, nowHm: string, frozen = false): LightQuote | null {
   if (!b.lighting.enabled || !court || !b.lighting.onAt) return null
   const endOf = b.lighting.offAt ?? (isActive(b, nowHm) ? nowHm : (b.actualEnd ?? b.end))
-  const minutes = Math.max(0, hm(endOf) - hm(b.lighting.onAt))
-  const halfFactor = b.scope === 'full' ? 2 : 1
-  const gross = minutes * court.lighting.pricePerMinute * halfFactor
-  const rate = b.acceptMerge ? 0.8 : 1
-  const fee = gross * rate
+  const price = court.lighting.pricePerMinute
   const present = Math.max(1, b.members.filter(m => m.checkedIn).length)
-  return {
-    minutes,
-    gross,
-    rate,
-    fee,
-    perPerson: fee / present,
-    frozen
+  const fullFactor = b.scope === 'full' ? 2 : 1
+  const normalRate = b.acceptMerge ? 0.8 : 1
+  const split = b.lighting.splitAt
+
+  const pack = (minutes: number, gross: number, fee: number, segments: LightSegment[]): LightQuote => ({
+    minutes, gross, rate: gross > 0 ? fee / gross : normalRate, fee, perPerson: fee / present, frozen, segments
+  })
+
+  // 无分界：整段按当前 scope 计
+  if (!split || hm(split) <= hm(b.lighting.onAt)) {
+    const minutes = Math.max(0, hm(endOf) - hm(b.lighting.onAt))
+    const gross = minutes * price * fullFactor
+    const fee = gross * normalRate
+    return pack(minutes, gross, fee, [{
+      label: fullFactor === 2 ? '全场（2 个半场）' : '半场',
+      minutes, factor: fullFactor, rate: normalRate, fee
+    }])
   }
+
+  // 分界前（按当时 scope/折扣，释放时冻结），分界后按队长选择决定占用范围
+  const f1 = b.lighting.factorBefore ?? fullFactor
+  const r1 = b.lighting.rateBefore ?? normalRate
+  const m1 = Math.max(0, hm(split) - hm(b.lighting.onAt))
+  const fee1 = m1 * price * f1 * r1
+  const m2 = Math.max(0, hm(endOf) - hm(split))
+  // 释放/主动降场：原队只保留 1 个半场；拒绝调整被释放后不再享 8 折（R-MERGE-3）。
+  // 坚持包场（surrendered）：仍占全场 2 个半场、取消 8 折，差额另以资源占用费计。
+  const surrendered = b.adjust?.status === 'surrendered'
+  const f2 = surrendered ? 2 : 1
+  const r2 = (b.adjust?.status === 'released' || surrendered) ? 1 : normalRate
+  const fee2 = m2 * price * f2 * r2
+  const totalMin = m1 + m2
+  const gross = totalMin * price * 2
+  const segments: LightSegment[] = []
+  if (m1 > 0) segments.push({ label: `${b.lighting.onAt}–${split} 全场（分界前）`, minutes: m1, factor: f1, rate: r1, fee: fee1 })
+  if (m2 > 0) segments.push({
+    label: surrendered ? `${split} 起坚持包场·全场（取消 8 折）` : `${split} 起保留半场（分界后）`,
+    minutes: m2, factor: f2, rate: r2, fee: fee2
+  })
+  return pack(totalMin, gross, fee1 + fee2, segments)
 }
 
 // ---------- 到场 / 迟到 / 超时 ----------
@@ -236,6 +286,16 @@ export function bookingRisk(b: Booking, incidents: Incident[], nowHm: string): R
   if (b.credit < 80) raise('medium', `信用分 ${b.credit}（低于 80，冲突排序靠后）`)
   if (b.credit < 60) raise('high', `信用分 ${b.credit}（低于 60，应暂停预约资格）`)
 
+  // 全场人数不足自动调整（R-MERGE-2 ~ R-MERGE-4）
+  const av = b.adjust ? adjustView(b, [], nowHm) : null
+  if (av && (av.status === 'prompting' || av.status === 'rejected')) {
+    if (av.adminReleasable) raise('high', `全场到场仅 ${av.present} 人，${av.status === 'rejected' ? '队长已拒绝调整且' : ''}保留期已过，管理员可释放一个半场给候补散客（R-MERGE-3）`)
+    else raise('medium', `全场到场仅 ${av.present} 人（不足 ${av.trigger} 人），请在保留期剩 ${Math.max(0, av.remaining)} 分钟内：接受拼场 / 降为半场 / 补缴差额（R-MERGE-2）`)
+  }
+  if (av && (av.status === 'released' || av.status === 'halved') && !av.bothConfirmed) {
+    raise('medium', `已${av.status === 'released' ? '释放' : '缩为'}半场，等待${av.captainConfirmed ? '' : '队长'}${(!av.captainConfirmed && !av.walkerConfirmed) ? '与' : ''}${av.walkerConfirmed ? '' : '散客'}确认新边界（R-MERGE-4）`)
+  }
+
   for (const inc of incidents) {
     if (!inc.bookingIds.includes(b.id) || !ACTIVE_INCIDENT.includes(inc.status)) continue
     switch (inc.type) {
@@ -289,7 +349,7 @@ export function courtRisk(c: Court, bookings: Booking[], incidents: Incident[], 
 // ---------- 场地占用 / 可用性 ----------
 export function bookingsOfHalf(c: Court, half: string, bookings: Booking[]): Booking[] {
   return bookings
-    .filter(b => b.courtId === c.id && b.halves.includes(half))
+    .filter(b => b.courtId === c.id && effectiveHalves(b).includes(half))
     .sort((a, b2) => hm(a.start) - hm(b2.start))
 }
 
@@ -360,4 +420,104 @@ export function rejectMergeCheck(b: Booking, req: MergeRequest): { unreasonable:
   }
   if (total >= 6) return { unreasonable: true, hint: '拼入后达到半场合理人数（≥6 人），无理由拒绝将收 20 元资源占用费并扣信用 5 分（R-MERGE-1）' }
   return { unreasonable: false, hint: '当前人数不足，建议同意拼场以提高场地利用率' }
+}
+
+// ---------- 全场人数不足 · 自动调整（R-MERGE-2 ~ R-MERGE-4） ----------
+
+/** 调整/释放后该预约实际占用的半场（原全场缩为一个半场） */
+export function effectiveHalves(b: Booking): string[] {
+  const a = b.adjust
+  if (a && a.keptHalf && ['halved', 'released', 'confirmed'].includes(a.status)) return [a.keptHalf]
+  return b.halves
+}
+
+export function bookingOccupies(b: Booking, half: string): boolean {
+  return effectiveHalves(b).includes(half)
+}
+
+export interface AdjustView {
+  active: boolean
+  status: AdjustStatus
+  promptedAt: string
+  holdMinutes: number
+  /** 保留期已过分钟数 */
+  elapsed: number
+  /** 保留期剩余分钟（负=已超期） */
+  remaining: number
+  holdOverdue: boolean
+  /** 队长拒绝且超过保留时间，或保留期届满未选择 → 管理员可释放 */
+  adminReleasable: boolean
+  present: number
+  trigger: number
+  /** 还差几人达到触发线 */
+  shortBy: number
+  /** 正在等待加入的候补散客申请 */
+  candidates: MergeRequest[]
+  keptHalf?: string
+  freedHalf?: string
+  releasedBookingId?: string
+  splitAt?: string
+  captainConfirmed: boolean
+  walkerConfirmed: boolean
+  bothConfirmed: boolean
+  appealed: boolean
+}
+
+export function adjustView(b: Booking, requests: MergeRequest[], nowHm: string): AdjustView | null {
+  const a = b.adjust
+  if (!a) return null
+  const elapsed = hm(nowHm) - hm(a.promptedAt)
+  const remaining = a.holdMinutes - elapsed
+  const holdOverdue = elapsed >= a.holdMinutes
+  const adminReleasable =
+    holdOverdue && (a.status === 'rejected' || a.status === 'prompting')
+  const candidates = a.candidateRequestIds
+    .map(id => requests.find(r => r.id === id))
+    .filter((r): r is MergeRequest => !!r)
+  const present = checkedInCount(b)
+  return {
+    active: ['prompting', 'rejected', 'merging', 'halved', 'released'].includes(a.status),
+    status: a.status,
+    promptedAt: a.promptedAt,
+    holdMinutes: a.holdMinutes,
+    elapsed,
+    remaining,
+    holdOverdue,
+    adminReleasable,
+    present,
+    trigger: FULL_SHORTAGE_TRIGGER,
+    shortBy: Math.max(0, FULL_SHORTAGE_TRIGGER - present),
+    candidates,
+    keptHalf: a.keptHalf,
+    freedHalf: a.freedHalf,
+    releasedBookingId: a.releasedBookingId,
+    splitAt: a.splitAt,
+    captainConfirmed: !!a.confirmedByCaptain,
+    walkerConfirmed: !!a.confirmedByWalker,
+    bothConfirmed: !!a.confirmedByCaptain && !!a.confirmedByWalker,
+    appealed: !!a.appealed
+  }
+}
+
+/** 坚持包场：全场相对半场的照明差额（单价 × 分钟，不享 8 折，R-MERGE-2） */
+export function surrenderQuote(b: Booking, court: Court | undefined, nowHm: string): { minutes: number; amount: number; toEnd: number } | null {
+  if (!court || !b.adjust) return null
+  const from = b.adjust.promptedAt
+  const cur = b.lighting.offAt ?? (isActive(b, nowHm) ? nowHm : (b.actualEnd ?? b.end))
+  const minutes = Math.max(0, hm(cur) - hm(from))
+  const toEnd = Math.max(0, hm(b.end) - hm(from))
+  // 相对"接受拼场（全场 2 半场 × 8 折）"的增量：2 × 单价 × (1−0.8) = 0.4 × 单价/分钟
+  const SURRENDER_PREMIUM = 0.4
+  return {
+    minutes,
+    amount: Math.round(minutes * court.lighting.pricePerMinute * SURRENDER_PREMIUM * 100) / 100,
+    toEnd: Math.round(toEnd * court.lighting.pricePerMinute * SURRENDER_PREMIUM * 100) / 100
+  }
+}
+
+/** 结束前 10 分钟提醒（R-MERGE-4：结束提醒） */
+export function endReminder(b: Booking, nowHm: string): boolean {
+  if (!isActive(b, nowHm)) return false
+  const r = timeState(b, nowHm).remaining
+  return r > 0 && r <= 10
 }

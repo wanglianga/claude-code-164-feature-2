@@ -5,11 +5,11 @@ import {
   NRadioGroup, NRadio, NForm, NFormItem, useMessage
 } from 'naive-ui'
 import {
-  useState, nowStr, releaseBooking, endUsage, setSurface, adminReschedule
+  useState, nowStr, releaseBooking, endUsage, setSurface, adminReschedule, releaseHalf
 } from '../store'
 import {
   STATUS_META, PAY_META, bookingRisk, checkedInCount, hm, isActive, money,
-  feeSummary, timeState
+  feeSummary, timeState, adjustView
 } from '../lib/engine'
 import type { Booking, SurfaceStatus } from '../types'
 import RiskTag from '../components/RiskTag.vue'
@@ -90,6 +90,38 @@ function submitReschedule() {
   resTarget.value = null
 }
 
+// 全场人数不足调整（R-MERGE-2 ~ R-MERGE-4）
+const adjustPending = computed(() =>
+  state.bookings
+    .filter(b => b.adjust && (b.adjust.status === 'prompting' || b.adjust.status === 'rejected'))
+    .map(b => ({ b, v: adjustView(b, state.mergeRequests, nowStr.value)! })))
+
+const adjustDone = computed(() =>
+  state.bookings
+    .filter(b => b.adjust && ['halved', 'released', 'confirmed'].includes(b.adjust.status))
+    .map(b => ({ b, v: adjustView(b, state.mergeRequests, nowStr.value)! })))
+
+const releaseTarget = ref<Booking | null>(null)
+const releaseForm = ref<{ kept: string; lead: string }>({ kept: '', lead: '' })
+function openRelease(b: Booking) {
+  releaseTarget.value = b
+  const v = adjustView(b, state.mergeRequests, nowStr.value)!
+  releaseForm.value = { kept: b.halves[0], lead: v.candidates[0]?.id ?? '' }
+}
+function submitRelease() {
+  if (!releaseTarget.value) return
+  releaseHalf(releaseTarget.value.id, releaseForm.value.kept, releaseForm.value.lead || undefined)
+  message.success('半场已释放给候补散客，费用重算与投诉入口已同步双方')
+  releaseTarget.value = null
+}
+function walkerOf(b: Booking) {
+  return b.adjust?.releasedBookingId ? state.bookings.find(x => x.id === b.adjust!.releasedBookingId) : undefined
+}
+function walkerLabel(b: Booking) {
+  const w = walkerOf(b)
+  return w ? `${w.teamName}（签到 ${checkedInCount(w)} 人）` : '候补散客'
+}
+
 // 公平性配额（今日 18:00–21:00 黄金时段）
 const fairness = computed(() => {
   const gold = state.bookings.filter(b => hm(b.start) >= 18 * 60 && hm(b.start) < 21 * 60 &&
@@ -122,6 +154,57 @@ const fairness = computed(() => {
       <NButton size="small" type="primary" ghost round @click="openIncidents()">
         事件处置（{{ state.incidents.filter(i => i.status !== 'resolved' && i.status !== 'penalized').length }}）
       </NButton>
+    </div>
+
+    <!-- 全场人数不足 · 自动调整专区 -->
+    <div v-if="adjustPending.length || adjustDone.length" class="adjust-zone">
+      <div class="az-title">✂️ 全场人数不足 · 自动调整 <RuleLink id="R-MERGE-2" /> <RuleLink id="R-MERGE-3" /> <RuleLink id="R-MERGE-4" /></div>
+
+      <!-- 待队长选择 / 可释放 -->
+      <div v-for="{ b, v } in adjustPending" :key="b.id" class="az-row"
+        :class="{ overdue: v.adminReleasable }">
+        <div class="azr-top">
+          <b>{{ b.teamName }}</b>
+          <NTag size="tiny" :type="v.adminReleasable ? 'error' : 'warning'">
+            {{ v.adminReleasable ? '保留期已过 · 可释放' : `保留期剩 ${Math.max(0, v.remaining)} 分` }}
+          </NTag>
+        </div>
+        <div class="azr-meta">
+          {{ courtName(b.courtId) }} · 全场 {{ b.halves.join('+') }} · {{ b.start }}–{{ b.end }} ·
+          到场 <b style="color:#d03050">{{ v.present }}</b> 人（不足 {{ v.trigger }}）·
+          候补 {{ v.candidates.length }} 组
+          <NTag v-if="v.status === 'rejected'" size="tiny" type="error">队长已拒绝</NTag>
+        </div>
+        <div class="azr-actions">
+          <NButton size="tiny" type="error" round :disabled="!v.adminReleasable"
+            @click="openRelease(b)">
+            {{ v.adminReleasable ? '释放一个半场给候补' : `保留期内不可释放（剩 ${Math.max(0, v.remaining)} 分）` }}
+          </NButton>
+          <NButton size="tiny" round @click="openIncidents('halfRelease')">查看投诉/工单</NButton>
+        </div>
+      </div>
+
+      <!-- 已释放/缩场：双方确认总览 -->
+      <div v-for="{ b, v } in adjustDone" :key="b.id" class="az-row done">
+        <div class="azr-top">
+          <b>{{ b.teamName }}</b>
+          <NTag size="tiny" :type="v.bothConfirmed ? 'success' : 'warning'">
+            {{ v.bothConfirmed ? '双方已确认' : '等待双方确认' }}
+          </NTag>
+        </div>
+        <div class="azr-meta">
+          {{ courtName(b.courtId) }} · 本队保留 <b>{{ v.keptHalf }}</b> · 释放 <b>{{ v.freedHalf }}</b>
+          （分界 {{ v.splitAt }}）→ {{ walkerLabel(b) }}
+        </div>
+        <div class="azr-confirm">
+          <NTag size="tiny" :type="v.captainConfirmed ? 'success' : 'default'">{{ v.captainConfirmed ? '✅ 队长已确认' : '⏳ 队长待确认' }}</NTag>
+          <NTag size="tiny" :type="v.walkerConfirmed ? 'success' : 'default'">{{ v.walkerConfirmed ? '✅ 散客已确认' : '⏳ 散客待确认' }}</NTag>
+          <NTag v-if="v.appealed" size="tiny" type="warning">队长已申诉·待裁决</NTag>
+        </div>
+      </div>
+      <div v-if="adjustDone.length" class="az-note">
+        未双方确认前任一方不得占用对方半场；确认后越界争抢按 <RuleLink id="R-DISPUTE-1" /> 先到先得+信用分处置，可暂停责任方资格 7 天。
+      </div>
     </div>
 
     <!-- 分时段预约表 -->
@@ -231,6 +314,38 @@ const fairness = computed(() => {
         <NButton type="primary" block round @click="submitReschedule">确认改约并通知队长</NButton>
       </NForm>
     </BottomSheet>
+
+    <!-- 释放半场确认抽屉 -->
+    <BottomSheet :show="!!releaseTarget" title="释放一个半场给候补散客" @update:show="v => !v && (releaseTarget = null)">
+      <NForm v-if="releaseTarget" label-placement="top" size="small">
+        <NAlert type="warning" style="margin-bottom:8px">
+          <div style="font-size:12.5px;line-height:1.7">
+            {{ releaseTarget.teamName }} 预约全场但到场仅 {{ checkedInCount(releaseTarget) }} 人，
+            队长{{ releaseTarget.adjust?.status === 'rejected' ? '已拒绝调整' : '保留期内未完成选择' }}。
+            释放后：原队保留一个半场、空出半场由候补散客承接；照明按当前时间<b>分段重算</b>（此前全场、此后各付半场），
+            全场押金降为半场、差额退回；同时生成含投诉/申诉入口的工单。
+            <RuleLink id="R-MERGE-3" /> <RuleLink id="R-MERGE-4" />
+          </div>
+        </NAlert>
+        <NFormItem label="原队保留的半场">
+          <NRadioGroup v-model:value="releaseForm.kept">
+            <NRadio v-for="h in releaseTarget.halves" :key="h" :value="h">{{ h }}</NRadio>
+          </NRadioGroup>
+        </NFormItem>
+        <NFormItem label="承接的候补散客（按排队顺位）">
+          <NSelect v-model:value="releaseForm.lead"
+            :options="adjustView(releaseTarget, state.mergeRequests, nowStr)?.candidates.map(r => ({
+              label: `${r.walkerName} 等 ${r.people} 人（${r.time} 候补）`, value: r.id
+            })) ?? []" />
+        </NFormItem>
+        <NPopconfirm placement="top" @positive-click="submitRelease">
+          <template #trigger>
+            <NButton type="error" block round>确认释放半场并通知双方</NButton>
+          </template>
+          释放后原队信用 -2、记资源占用警示（不记爽约、押金不全扣）。确认执行？
+        </NPopconfirm>
+      </NForm>
+    </BottomSheet>
   </div>
 
   <!-- 社区工作人员：引导到事件页 -->
@@ -254,6 +369,16 @@ const fairness = computed(() => {
 .kpi-n { font-size:18px; font-weight:800; }
 .kpi-l { font-size:11px; color:#909399; }
 .filter-bar { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+.adjust-zone { background:linear-gradient(135deg,#fff7e6,#fff1f0); border:1px solid #ffe0b8; border-radius:12px; padding:10px 12px; margin-bottom:12px; }
+.az-title { font-weight:700; font-size:13px; margin-bottom:8px; }
+.az-row { background:#fff; border-radius:8px; padding:8px 10px; margin-bottom:8px; border:1px solid #f0f0f0; }
+.az-row.overdue { border-color:#ffccc7; background:#fff7f6; }
+.az-row.done { background:#f6fffa; border-color:#c7f0d8; }
+.azr-top { display:flex; justify-content:space-between; align-items:center; }
+.azr-meta { font-size:12px; color:#666; line-height:1.7; margin:3px 0; }
+.azr-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:4px; }
+.azr-confirm { display:flex; gap:6px; flex-wrap:wrap; margin-top:5px; }
+.az-note { font-size:11.5px; color:#888; line-height:1.7; }
 .slot-block { margin-bottom:14px; }
 .slot-title { font-weight:700; font-size:13px; color:#444; margin-bottom:6px; }
 .slot-empty { font-size:12px; color:#aaa; padding:4px 2px; }

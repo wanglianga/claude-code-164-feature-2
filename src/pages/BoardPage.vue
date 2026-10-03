@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { NButton, NTag, NEmpty, NAlert, NGrid, NGridItem } from 'naive-ui'
-import { useState, nowStr, releaseBooking, endUsage } from '../store'
+import { useState, nowStr, releaseBooking, endUsage, lightLive } from '../store'
 import {
   SURFACE_META, HOOP_META, bookingsOfHalf, checkedInCount, courtRisk,
-  fmt, halfSealed, isActive, timeState
+  fmt, halfSealed, isActive, timeState, money
 } from '../lib/engine'
 import type { Booking, Court } from '../types'
 import RiskTag from '../components/RiskTag.vue'
@@ -21,6 +21,15 @@ function nextOf(c: Court, h: string): Booking | undefined {
     .filter(b => b.status === 'booked')
     .sort((a, b) => a.start.localeCompare(b.start))[0]
 }
+
+// 释放/缩场后的半场配对信息
+function adjustOf(b: Booking) {
+  if (b.adjust && ['halved', 'released', 'confirmed'].includes(b.adjust.status)) return b.adjust
+  const src = state.bookings.find(x => x.id === b.releasedFromBookingId)
+  return src?.adjust
+}
+function isWalkerHalf(b: Booking) { return !!b.releasedFromBookingId }
+function endHot(b: Booking) { const r = timeState(b, nowStr.value).remaining; return isActive(b, nowStr.value) && r > 0 && r <= 10 }
 
 const stats = computed(() => {
   const active = state.bookings.filter(b => isActive(b, nowStr.value))
@@ -100,6 +109,38 @@ function forceEnd(b: Booking) { endUsage(b.id, true) }
             到场 {{ checkedInCount(currentOf(c, h)!) }}/{{ currentOf(c, h)!.members.length }} ·
             签到码 {{ currentOf(c, h)!.checkInCode }}
           </div>
+
+          <!-- 释放/缩场后的分区信息（R-MERGE-4） -->
+          <div v-if="adjustOf(currentOf(c, h)!)" class="hr-split">
+            <template v-if="isWalkerHalf(currentOf(c, h)!)">
+              <div class="sp-line">🚧 候补散客半场（承接释放，自 {{ currentOf(c, h)!.start }}），与
+                {{ state.bookings.find(x => x.id === currentOf(c, h)!.releasedFromBookingId)?.teamName }} 沿中线分区
+              </div>
+            </template>
+            <template v-else>
+              <div class="sp-line">
+                🚧 全场缩为半场：本队保留 {{ adjustOf(currentOf(c, h)!)!.keptHalf }}，
+                {{ adjustOf(currentOf(c, h)!)!.freedHalf }} 已分给候补散客（分界 {{ adjustOf(currentOf(c, h)!)!.splitAt }}）
+              </div>
+            </template>
+            <div class="sp-line" v-if="lightLive(currentOf(c, h)!)">
+              💡 照明各付半场：本组累计 ¥{{ money(lightLive(currentOf(c, h)!)!.fee) }}
+              （{{ lightLive(currentOf(c, h)!)!.minutes }} 分，签到人均摊）
+            </div>
+            <div class="sp-line" :class="{ hot: endHot(currentOf(c, h)!) }">
+              ⏰ {{ endHot(currentOf(c, h)!) ? '距结束不足 10 分钟，请准备清场' : `结束 ${currentOf(c, h)!.end} 前 10 分钟提醒，结束后 5 分清场缓冲` }}
+            </div>
+            <div class="sp-confirm">
+              <NTag size="tiny" :type="adjustOf(currentOf(c, h)!)!.confirmedByCaptain ? 'success' : 'warning'">
+                {{ adjustOf(currentOf(c, h)!)!.confirmedByCaptain ? '队长已确认' : '队长待确认' }}
+              </NTag>
+              <NTag size="tiny" :type="adjustOf(currentOf(c, h)!)!.confirmedByWalker ? 'success' : 'warning'">
+                {{ adjustOf(currentOf(c, h)!)!.confirmedByWalker ? '散客已确认' : '散客待确认' }}
+              </NTag>
+              <RuleLink id="R-MERGE-4" />
+            </div>
+          </div>
+
           <div v-if="timeState(currentOf(c, h)!, nowStr).releasable" class="hr-release">
             ⏰ 开场超 20 分钟未签到 → 可释放给候补散客
             <NButton v-if="state.role === 'admin'" size="tiny" type="error" round style="margin-left:6px"
@@ -169,6 +210,10 @@ function forceEnd(b: Booking) { endUsage(b.id, true) }
 .hr-off { font-weight:700; color:#d03050; font-size:14px; }
 .hr-rule { font-size:12px; color:#999; margin-top:2px; }
 .hr-release { background:#fff7e6; border-radius:6px; padding:4px 6px; font-size:12px; color:#ad6800; margin-top:6px; display:flex; align-items:center; flex-wrap:wrap; }
+.hr-split { background:#f0f9f4; border:1px solid #d6f0e0; border-radius:8px; padding:5px 8px; margin-top:6px; }
+.sp-line { font-size:12px; color:#3a6b4f; line-height:1.7; }
+.sp-line.hot { color:#d03050; font-weight:700; }
+.sp-confirm { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-top:3px; }
 .idle .hr-team { color:#18a058; }
 .cb-foot { display:flex; justify-content:space-between; align-items:center; font-size:11px; color:#999; border-top:1px dashed #eee; padding-top:6px; }
 .dispute-guide { background:#fff; border-radius:12px; padding:12px; box-shadow:0 1px 4px rgba(0,0,0,.06); font-size:12px; line-height:2; }

@@ -454,6 +454,53 @@ export const BOOKINGS: Booking[] = [
       { at: '15:20', text: '队长点击"结束使用并关灯"，按实际 50 分钟结算', tone: 'success' },
       { at: '15:22', text: '押金 50 元扣除照明 40 元，退回 10 元（1–3 工作日到账）', tone: 'success' }
     ]
+  },
+  {
+    id: 'B011',
+    code: '880217',
+    courtId: 'court-3',
+    halves: ['H3', 'H4'],
+    scope: 'full',
+    date: TODAY,
+    start: '19:00',
+    end: '21:00',
+    actualStart: '19:02',
+    headcount: 4,
+    acceptMerge: true,
+    teamName: '猎鹰队',
+    captainId: 'u-chen',
+    captainName: '陈晨',
+    captainPhone: '138****0001',
+    fixedTeam: false,
+    credit: 89,
+    status: 'ongoing',
+    payStatus: 'depositPaid',
+    checkInCode: '880217',
+    lockerNos: [20],
+    lighting: { enabled: true, onAt: '19:03', minutes: 0, fee: 0, deposit: 100 },
+    fees: [
+      { kind: 'lighting', label: '照明费（全场 ×2 半场，实时累计）', amount: 0, ruleId: 'R-LIGHT-1' }
+    ],
+    members: [
+      { id: 'm11-1', name: '陈晨', phone: '138****0001', isCaptain: true, checkedIn: true, checkInAt: '19:02' },
+      { id: 'm11-2', name: '高远', phone: '138****5502', isCaptain: false, checkedIn: true, checkInAt: '19:04' },
+      { id: 'm11-3', name: '刘琪', phone: '138****5503', isCaptain: false, checkedIn: true, checkInAt: '19:06' },
+      { id: 'm11-4', name: '周立', phone: '138****5504', isCaptain: false, checkedIn: true, checkInAt: '19:08' }
+    ],
+    adjust: {
+      status: 'prompting',
+      promptedAt: '19:30',
+      holdMinutes: 15,
+      candidateRequestIds: ['MR-4', 'MR-5']
+    },
+    timeline: [
+      { at: '09:40', text: '预约河滨 H3/H4 全场 19:00–21:00，预付照明押金 100 元', tone: 'success' },
+      { at: '19:02', text: '队长陈晨等 4 人到场签到（全场建议 8–14 人，人数偏少）', tone: 'warning' },
+      { at: '19:03', text: '全场照明开启（H3/H4 两个半场），开始计费', tone: 'info' },
+      { at: '19:30', text: '开场 15 分钟后全场签到仅 4 人（不足 6 人），现场有候补散客：推送调整提示，队长须在 15 分钟保留期内（至 19:45）选择接受拼场 / 降为半场 / 补缴全场差额（R-MERGE-2）', tone: 'warning' },
+      { at: '19:31', text: '散客王同学等 3 人申请候补加入', tone: 'info' },
+      { at: '19:33', text: '散客赵小飞等 2 人申请候补加入', tone: 'info' }
+    ]
   }
 ]
 
@@ -585,5 +632,25 @@ export const MERGE_REQUESTS: MergeRequest[] = [
     status: 'rejected',
     unreasonable: true,
     time: '17:52'
+  },
+  {
+    id: 'MR-4',
+    bookingId: 'B011',
+    walkerName: '王同学',
+    walkerPhone: '150****3321',
+    people: 3,
+    message: '我们 3 个就在河滨现场，全场才 4 人，求补位拼到 21 点',
+    status: 'pending',
+    time: '19:31'
+  },
+  {
+    id: 'MR-5',
+    bookingId: 'B011',
+    walkerName: '赵小飞',
+    walkerPhone: '151****6677',
+    people: 2,
+    message: '两个人，自带球，若能分一个半场出来也可以接',
+    status: 'pending',
+    time: '19:33'
   }
 ]

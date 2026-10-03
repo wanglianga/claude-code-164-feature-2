@@ -6,13 +6,15 @@ import {
 } from 'naive-ui'
 import {
   useState, nowStr, addMember, toggleCheckIn, respondMerge,
-  payDeposit, turnOnLight, endUsage, topUp, applyMerge, checkInByCode
+  payDeposit, turnOnLight, endUsage, topUp, applyMerge, checkInByCode,
+  walkerTurnOnLight, confirmAdjust
 } from '../store'
 import { checkedInCount, rejectMergeCheck, hm, isActive, timeState } from '../lib/engine'
 import type { Booking, MergeRequest } from '../types'
 import BookingCard from '../components/BookingCard.vue'
 import BottomSheet from '../components/BottomSheet.vue'
 import RuleLink from '../components/RuleLink.vue'
+import AdjustPanel from '../components/AdjustPanel.vue'
 
 const state = useState()
 const message = useMessage()
@@ -85,7 +87,11 @@ const mergeable = computed(() =>
     .filter(b => b.acceptMerge && ['booked', 'ongoing'].includes(b.status))
     .filter(b => {
       const c = state.courts.find(x => x.id === b.courtId)!
-      return !c.sealed && b.members.length < (b.scope === 'full' ? 14 : 8)
+      if (c.sealed) return false
+      if (b.members.length >= (b.scope === 'full' ? 14 : 8)) return false
+      // 排除自己已承接的释放半场
+      if (b.releasedFromBookingId && (b.captainName === applyForm.value.name || b.captainPhone === applyForm.value.phone)) return false
+      return true
     })
     .sort((a, b) => hm(a.start) - hm(b.start)))
 
@@ -112,6 +118,24 @@ function doCodeCheckIn() {
   if (ok) { message.success('签到成功！'); codeForm.value.code = '' }
   else message.error('签到码无效，请向队长确认')
 }
+
+// 散客承接的释放半场（R-MERGE-3 / R-MERGE-4）
+const myReleasedHalves = computed<Booking[]>(() =>
+  state.bookings
+    .filter(b => b.releasedFromBookingId && (b.captainName === '王同学' || b.captainPhone === applyForm.value.phone))
+    .sort((a, b) => hm(a.start) - hm(b.start)))
+
+function releasedFrom(b: Booking) {
+  return state.bookings.find(x => x.id === b.releasedFromBookingId)
+}
+function adjustOfReleased(b: Booking) {
+  return releasedFrom(b)?.adjust
+}
+function walkerConfirmed(b: Booking) { return !!adjustOfReleased(b)?.confirmedByWalker }
+function captainConfirmedRel(b: Booking) { return !!adjustOfReleased(b)?.confirmedByCaptain }
+function doWalkerLight(b: Booking) { walkerTurnOnLight(b.id); message.success(`${b.halves.join('/')} 照明已开启，开始计费`) }
+function doWalkerConfirm(b: Booking) { confirmAdjust(b.releasedFromBookingId!, 'walker'); message.success('散客方已确认新边界与照明分摊') }
+
 
 function courtName(id: string) { return state.courts.find(c => c.id === id)?.name ?? '' }
 </script>
@@ -150,6 +174,7 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
       <NEmpty v-if="myBookings.length === 0" description="还没有预约，去场地页约一场吧" />
 
       <div v-for="b in myBookings" :key="b.id">
+        <AdjustPanel v-if="b.adjust" :booking="b" />
         <BookingCard :booking="b">
           <template #actions>
             <!-- 待开场 -->
@@ -199,6 +224,47 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
         <NButton type="primary" round @click="doCodeCheckIn">签到</NButton>
       </div>
 
+      <!-- 承接释放半场 -->
+      <template v-if="myReleasedHalves.length">
+        <div class="section-title">我承接的释放半场（{{ myReleasedHalves.length }}）</div>
+        <div v-for="wb in myReleasedHalves" :key="wb.id">
+          <NAlert type="info" class="walker-half-tip">
+            <div style="font-size:12.5px;font-weight:700">
+              ✂️ 你承接 {{ wb.halves.join('/') }} 半场（{{ wb.start }}–{{ wb.end }}），原队
+              {{ releasedFrom(wb)?.teamName }} 保留 {{ adjustOfReleased(wb)?.keptHalf }}
+            </div>
+            <div style="font-size:12px;line-height:1.8;margin-top:3px">
+              🚧 沿<b>中线/围挡</b>分区：你方活动范围限 {{ wb.halves.join('/') }} 篮筐，不得进入 {{ adjustOfReleased(wb)?.keptHalf }}；<br />
+              💡 照明自 {{ wb.start }} 起由你方按所在半场单价自付（拼场按签到人均摊）；<br />
+              ⏰ {{ timeState(wb, nowStr).remaining > 0 && timeState(wb, nowStr).remaining <= 10 ? '距结束不足 10 分钟，请准备清场' : `结束前 10 分钟提醒，结束后 5 分钟清场缓冲（${wb.end} 结束）` }}
+              <RuleLink id="R-MERGE-4" />
+            </div>
+            <div style="display:flex;gap:8px;margin-top:6px">
+              <NTag size="small" :type="captainConfirmedRel(wb) ? 'success' : 'default'" round>
+                {{ captainConfirmedRel(wb) ? '✅ 队长已确认' : '⏳ 队长待确认' }}
+              </NTag>
+              <NTag size="small" :type="walkerConfirmed(wb) ? 'success' : 'default'" round>
+                {{ walkerConfirmed(wb) ? '✅ 我方已确认' : '⏳ 我方待确认' }}
+              </NTag>
+            </div>
+          </NAlert>
+          <BookingCard :booking="wb">
+            <template #actions>
+              <NButton v-if="!wb.lighting.enabled" size="small" type="warning" round @click="doWalkerLight(wb)">
+                💡 支付押金 ¥{{ state.courts.find(c => c.id === wb.courtId)?.lighting.deposit ?? 50 }} 并开灯（半场）
+              </NButton>
+              <NButton v-if="adjustOfReleased(wb) && !walkerConfirmed(wb)"
+                size="small" type="primary" round @click="doWalkerConfirm(wb)">
+                ✅ 确认边界与照明分摊
+              </NButton>
+              <NTag v-if="wb.lighting.enabled && walkerConfirmed(wb)" size="small" type="success" round>
+                已开灯并确认，安心使用
+              </NTag>
+            </template>
+          </BookingCard>
+        </div>
+      </template>
+
       <div class="section-title">找拼场（{{ mergeable.length }} 场可申请）</div>
       <NEmpty v-if="mergeable.length === 0" description="当前没有可拼的队伍，可去现场排队候补（R-FAIR-2）" />
       <div v-for="b in mergeable" :key="b.id" class="merge-card">
@@ -223,6 +289,9 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
           </NButton>
           <template v-for="r in myApplications.filter(x => x.bookingId === b.id)" :key="r.id">
             <NTag v-if="r.status === 'accepted'" size="small" type="success" round>已接受，凭码 {{ b.checkInCode }} 签到</NTag>
+            <NTag v-else-if="r.status === 'assigned'" size="small" type="success" round>
+              已为你分配释放半场，见上方"我承接的释放半场"
+            </NTag>
             <NTag v-else-if="r.status === 'rejected'" size="small" :type="r.unreasonable ? 'error' : 'default'" round>
               {{ r.unreasonable ? '被拒（队长已被计资源占用费）' : '被拒（对方有正当理由）' }}
             </NTag>
@@ -320,6 +389,7 @@ function courtName(id: string) { return state.courts.find(c => c.id === id)?.nam
 .mr-minor { font-size:12px; color:#d03050; margin-top:4px; }
 .mr-actions { display:flex; gap:8px; margin-top:8px; }
 .walkin-code { display:flex; gap:8px; margin-bottom:10px; }
+.walker-half-tip { margin-bottom:10px; border-radius:10px; }
 .merge-card { background:#fff; border-radius:12px; padding:10px 12px; margin-bottom:10px; box-shadow:0 1px 4px rgba(0,0,0,.06); }
 .mc-top { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
 .mc-row { font-size:12px; color:#555; line-height:1.9; }

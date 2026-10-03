@@ -1,10 +1,10 @@
 import { computed, reactive, ref } from 'vue'
 import type {
   Booking, Court, FeeItem, Incident, IncidentAction, IncidentStatus,
-  IncidentType, Member, MergeRequest, RoleId, Scope, TimelineEvent
+  IncidentType, Member, MergeRequest, RoleId, Scope, TimelineEvent, HalfAdjust
 } from './types'
 import { BOOKINGS, COURTS, INCIDENTS, MERGE_REQUESTS, NOW_HM, ROLES, TODAY } from './data/mock'
-import { checkedInCount, feeSummary, hm, lightQuote } from './lib/engine'
+import { checkedInCount, feeSummary, hm, lightQuote, ADJUST_HOLD_MIN } from './lib/engine'
 
 // ---------- 模拟时钟 ----------
 const nowStr = ref(NOW_HM)
@@ -66,7 +66,7 @@ export function setRole(r: RoleId) {
   state.role = r
 }
 
-const idCounters: Record<string, number> = { B: 10, 'MR-': 3, I: 6 }
+const idCounters: Record<string, number> = { B: 11, 'MR-': 5, I: 6 }
 function nextId(prefix: string, pad = 3) {
   const n = (idCounters[prefix] = (idCounters[prefix] ?? 0) + 1)
   return `${prefix}${String(n).padStart(pad, '0')}`
@@ -241,6 +241,293 @@ export function respondMerge(reqId: string, accept: boolean, reason = '') {
   }
 }
 
+// ---------- 全场人数不足 · 自动调整（R-MERGE-2 ~ R-MERGE-4） ----------
+
+/** 队长三选一：接受拼场 / 降为半场 / 补缴全场差额 */
+export function chooseAdjust(bookingId: string, choice: 'merge' | 'half' | 'surrender', keptHalf?: string) {
+  const b = state.bookings.find(x => x.id === bookingId)!
+  const a = b.adjust!
+  a.decision = { choice, at: nowStr.value }
+
+  if (choice === 'merge') {
+    a.status = 'merging'
+    b.acceptMerge = true
+    tl(b, `队长选择「接受散客拼场」：候补散客加入同一全场，照明费按签到人数平摊并享 8 折（R-MERGE-2 / R-BOOK-2）`, 'success')
+    // 自动通过候补申请并把散客加进同一队伍
+    for (const reqId of a.candidateRequestIds) {
+      const req = state.mergeRequests.find(r => r.id === reqId)
+      if (req && req.status === 'pending') {
+        req.status = 'accepted'
+        for (let i = 0; i < req.people; i++) {
+          b.members.push({
+            id: `m-merge-${++seq.member}`,
+            name: i === 0 ? req.walkerName : `${req.walkerName}同伴${i + 1}`,
+            phone: req.walkerPhone,
+            isCaptain: false,
+            checkedIn: false,
+            minor: req.minor
+          })
+        }
+        b.headcount = b.members.length
+        notify('walkin', `拼场已通过：${b.teamName}（全场），到场向队长出示即可签到`)
+      }
+    }
+    notify('captain', `已接受拼场，候补散客到场签到后全场人数补齐`)
+  } else if (choice === 'half') {
+    const kept = keptHalf ?? b.halves[0]
+    const freed = b.halves.find(h => h !== kept)!
+    a.status = 'halved'
+    a.keptHalf = kept
+    a.freedHalf = freed
+    a.splitAt = nowStr.value
+    b.scope = 'half'
+    b.halves = [kept]
+    b.lighting.splitAt = nowStr.value
+    b.lighting.factorBefore = 2
+    b.lighting.rateBefore = 0.8
+    const court = state.courts.find(c => c.id === b.courtId)!
+    const halfDeposit = court.lighting.deposit
+    if (b.lighting.deposit > halfDeposit) {
+      const diff = b.lighting.deposit - halfDeposit
+      b.fees.push({ kind: 'halfAdjust', label: `降为半场 · 照明押金 ${b.lighting.deposit}→${halfDeposit}，差额当场退回`, amount: -diff, ruleId: 'R-MERGE-2' })
+      b.lighting.deposit = halfDeposit
+    }
+    // 空出半场按候补顺位分配给散客（主动缩场无处罚、不生成投诉工单），进入双方确认
+    const wb = assignFreedHalf(b, a, freed, nowStr.value)
+    if (wb) {
+      tl(b, `队长选择「降为半场」：保留 ${kept}，空出 ${freed} 已按候补顺位分给 ${wb.captainName} 等 ${wb.members.length} 人；照明按分界时间分段重算（此前全场、此后半场），押金差额原路退回；请双方确认新边界（R-MERGE-2 / R-MERGE-4）`, 'success')
+      notify('walkin', `${freed} 半场已分给你（${wb.start}–${wb.end}），请凭签到码 ${wb.code} 到场并确认边界`)
+    } else {
+      tl(b, `队长选择「降为半场」：保留 ${kept}，空出 ${freed} 暂作现场排队候补（R-FAIR-2）；照明按分界时间分段重算，押金差额原路退回（R-MERGE-2）`, 'success')
+      notify('walkin', `${freed} 半场已空出，现场散客可排队候补`)
+    }
+    notify('captain', `已降为半场（${kept}），照明与押金已按半场重算${wb ? '，请确认边界' : ''}`)
+  } else {
+    a.status = 'surrendered'
+    a.splitAt = nowStr.value
+    b.acceptMerge = false
+    b.lighting.splitAt = nowStr.value
+    b.lighting.factorBefore = 2
+    b.lighting.rateBefore = 0.8
+    const court = state.courts.find(c => c.id === b.courtId)!
+    const toEndMin = Math.max(0, hm(b.end) - hm(nowStr.value))
+    // 差额=分界后全场原价（2 半场）相对拼场 8 折的上浮：0.4 × 半场单价/分钟，已并入分段照明，不另立收费
+    const diff = Math.round(toEndMin * court.lighting.pricePerMinute * 0.4 * 100) / 100
+    tl(b, `队长选择「坚持包场」：自 ${nowStr.value} 起保留全场 ${b.halves.join('/')}、取消拼场 8 折，按全场 2 个半场原价计费，预计至 ${b.end} 比接受拼场多缴约 ${diff} 元（R-MERGE-2）`, 'warning')
+    notify('captain', `已按全场原价续用至 ${b.end}，结束时结算；候补散客将被引导至其他场地`)
+    // 通知候补散客
+    for (const reqId of a.candidateRequestIds) {
+      const req = state.mergeRequests.find(r => r.id === reqId)
+      if (req && req.status === 'pending') notify('walkin', `${b.teamName} 选择坚持包场，已为你推荐其他可拼/候补场地`)
+    }
+  }
+}
+
+/** 队长在保留期内明确拒绝调整（未选择），保留期内不释放 */
+export function rejectAdjust(bookingId: string, reason = '') {
+  const b = state.bookings.find(x => x.id === bookingId)!
+  const a = b.adjust!
+  a.status = 'rejected'
+  tl(b, `队长拒绝调整${reason ? `（理由：${reason}）` : ''}：保留期内不释放半场；若满 15 分钟仍未接受调整，管理员可释放一个半场给候补散客（R-MERGE-3）`, 'warning')
+  notify('admin', `${b.teamName} 拒绝全场人数调整，保留期届满后可释放半场`)
+}
+
+/** 为空出的半场新建候补散客半场预约并关联候补申请（R-MERGE-3 / R-MERGE-4）；无候补返回 undefined */
+function assignFreedHalf(b: Booking, a: HalfAdjust, freed: string, splitAt: string, leadRequestId?: string): Booking | undefined {
+  const lead = (leadRequestId ? state.mergeRequests.find(r => r.id === leadRequestId) : undefined)
+    ?? a.candidateRequestIds.map(id => state.mergeRequests.find(r => r.id === id)).find(r => r && r.status === 'pending')
+  if (!lead) return undefined
+  const walkerName = lead.walkerName
+  const walkerPhone = lead.walkerPhone
+  const people = lead.people
+
+  const wb: Booking = {
+    id: nextId('B'),
+    code: String(100000 + Math.floor(Math.random() * 899999)),
+    courtId: b.courtId,
+    halves: [freed],
+    scope: 'half',
+    date: b.date,
+    start: splitAt,
+    end: b.end,
+    actualStart: splitAt,
+    headcount: people,
+    acceptMerge: true,
+    teamName: `${walkerName} 候补散客场`,
+    captainId: 'u-walker',
+    captainName: walkerName,
+    captainPhone: walkerPhone,
+    members: [],
+    status: 'ongoing',
+    payStatus: 'unpaid',
+    checkInCode: '',
+    releasedFromBookingId: b.id,
+    lighting: { enabled: false, minutes: 0, fee: 0, deposit: 0 },
+    fees: [],
+    credit: 100,
+    timeline: []
+  }
+  wb.checkInCode = wb.code
+  for (let i = 0; i < people; i++) {
+    wb.members.push({
+      id: `m-rel-${++seq.member}`,
+      name: i === 0 ? walkerName : `${walkerName}同伴${i + 1}`,
+      phone: walkerPhone,
+      isCaptain: i === 0,
+      checkedIn: true,
+      checkInAt: splitAt
+    })
+  }
+  state.bookings.push(wb)
+  a.releasedBookingId = wb.id
+
+  lead.status = 'assigned'
+  lead.assignedBookingId = wb.id
+  a.candidateRequestIds = [...new Set([...(a.candidateRequestIds ?? []), lead.id])]
+  return wb
+}
+
+/**
+ * 管理员释放一个半场给候补散客（R-MERGE-3）。
+ * 原队缩为保留半场，新建一条散客半场预约承接空半场，照明分段重算，
+ * 同时生成含投诉/申诉入口的工单。
+ */
+export function releaseHalf(bookingId: string, keptHalf?: string, leadRequestId?: string): { booking: Booking; walker: Booking } {
+  const b = state.bookings.find(x => x.id === bookingId)!
+  const a = b.adjust!
+  const court = state.courts.find(c => c.id === b.courtId)!
+  const wasRejected = a.status === 'rejected'
+  const kept = keptHalf ?? b.halves[0]
+  const freed = b.halves.find(h => h !== kept)!
+  const splitAt = nowStr.value
+
+  a.status = 'released'
+  a.keptHalf = kept
+  a.freedHalf = freed
+  a.splitAt = splitAt
+  b.scope = 'half'
+  b.halves = [kept]
+  b.lighting.splitAt = splitAt
+  b.lighting.factorBefore = 2
+  b.lighting.rateBefore = 0.8
+  b.credit = Math.max(0, b.credit - 2)
+
+  // 全场押金降为半场押金，差额当场退回（费用结算时一并处理）
+  const halfDeposit = court.lighting.deposit
+  if (b.lighting.deposit > halfDeposit) {
+    const diff = b.lighting.deposit - halfDeposit
+    b.fees.push({ kind: 'halfAdjust', label: `释放半场 · 全场押金 ${b.lighting.deposit}→半场 ${halfDeposit}，差额当场退回`, amount: -diff, ruleId: 'R-MERGE-3' })
+    b.lighting.deposit = halfDeposit
+  }
+
+  // 承接散客：优先指定候补申请，否则取顺位第一；均无则登记现场排队队伍（R-FAIR-2）
+  let wb = assignFreedHalf(b, a, freed, splitAt, leadRequestId)
+  if (!wb) {
+    const walkup: MergeRequest = {
+      id: nextId('MR-'), bookingId: b.id, walkerName: '现场排队散客', walkerPhone: '管理员现场登记',
+      people: 4, message: '现场排队候补（管理员登记）', status: 'pending', time: nowStr.value
+    }
+    state.mergeRequests.unshift(walkup)
+    a.candidateRequestIds = [walkup.id, ...a.candidateRequestIds]
+    wb = assignFreedHalf(b, a, freed, splitAt, walkup.id)
+  }
+  const walker: Booking = wb!
+  const walkerName = walker.captainName
+  const people = walker.members.length
+
+  // 工单（投诉/申诉入口）
+  const inc = reportIncident(
+    'halfRelease',
+    b.courtId,
+    [b.id, walker.id],
+    `${b.teamName} 全场人数不足 · 释放 ${freed} 半场`,
+    `${b.teamName} 预约全场但开场 15 分钟后仅 ${b.members.filter(m => m.checkedIn).length} 人到场，队长${wasRejected ? '拒绝调整' : '保留期内未完成选择'}，管理员依规则释放 ${freed} 半场，由候补散客 ${walkerName} 等 ${people} 人承接。分界时间 ${splitAt}：此前照明按全场计、此后原队按 ${kept} 半场计、${freed} 照明由散客自付。双方可在此提交异议/投诉，队长可 24 小时内申诉。`,
+    '系统自动判定 + 管理员现场核验'
+  )
+  a.incidentId = inc.id
+  inc.ruleApplied = ['R-MERGE-3', 'R-MERGE-4']
+  inc.actions.push({
+    at: nowStr.value,
+    by: 'admin',
+    text: `管理员现场核验后释放 ${freed}：原队保留 ${kept}（全场押金降为半场、差额退回，照明按 ${splitAt} 分段重算）；候补散客 ${walkerName} 等 ${people} 人承接 ${freed}，费用自付。费用重算明细与投诉/申诉入口已同步双方。`
+  })
+
+  tl(b, `管理员释放 ${freed} 半场给候补散客 ${walkerName} 等 ${people} 人：本队保留 ${kept}，照明自 ${splitAt} 分段重算，记资源占用警示、信用 -2；对释放有异议可在工单中 24 小时内申诉（R-MERGE-3）`, 'error')
+  tl(walker, `承接释放半场 ${freed}（${splitAt}–${b.end}）：请与 ${b.teamName} 沿中线分区使用，并在页面确认场地边界与照明分摊（R-MERGE-4）`, 'success')
+
+  notify('admin', `${freed} 已释放给候补散客，费用重算与投诉入口已同步双方`)
+  notify('captain', `你保留 ${kept}，${freed} 已释放给散客；如有异议可在事件工单中申诉`)
+  notify('walkin', `${freed} 半场已分配，请凭签到码 ${walker.code} 到场并确认边界`)
+
+  return { booking: b, walker }
+}
+
+/** 双方确认新边界（R-MERGE-4） */
+export function confirmAdjust(bookingId: string, who: 'captain' | 'walker') {
+  const b = state.bookings.find(x => x.id === bookingId)!
+  const a = b.adjust!
+  if (who === 'captain') a.confirmedByCaptain = true
+  else a.confirmedByWalker = true
+  tl(b, who === 'captain' ? '队长已确认新的场地边界、照明分摊与结束提醒（R-MERGE-4）' : '散客方已确认新的场地边界、照明分摊与结束提醒（R-MERGE-4）', 'success')
+  if (a.confirmedByCaptain && a.confirmedByWalker) {
+    a.status = 'confirmed'
+    tl(b, '双方均已确认边界，分区生效；确认后越界争抢将按争议规则处置并可暂停预约资格 7 天（R-MERGE-4 / R-DISPUTE-1）', 'success')
+    notify('admin', `${b.teamName} 与候补散客均已确认边界，分区完成`)
+  } else {
+    notify('admin', `${b.teamName} 半场调整：${who === 'captain' ? '队长已确认，等待散客' : '散客已确认，等待队长'}确认`)
+  }
+}
+
+/** 散客对承接半场支付照明押金并开灯（分界后自付） */
+export function walkerTurnOnLight(bookingId: string) {
+  const wb = state.bookings.find(x => x.id === bookingId)!
+  const court = state.courts.find(c => c.id === wb.courtId)!
+  wb.lighting.deposit = court.lighting.deposit
+  wb.payStatus = 'depositPaid'
+  wb.lighting.enabled = true
+  wb.lighting.onAt = nowStr.value
+  if (!wb.fees.some(f => f.kind === 'lighting')) {
+    wb.fees.push({ kind: 'lighting', label: `照明费（${wb.halves.join('/')} 半场，实时累计）`, amount: 0, ruleId: 'R-LIGHT-1' })
+  }
+  tl(wb, `照明开启（半场 ${court.lighting.pricePerMinute} 元/分钟，拼场 8 折），开始计费（R-MERGE-4）`, 'info')
+}
+
+/** 队长对释放/缩场提交申诉（R-MERGE-3 投诉入口） */
+export function appealAdjust(bookingId: string, text: string) {
+  const b = state.bookings.find(x => x.id === bookingId)!
+  const a = b.adjust!
+  a.appealed = true
+  const inc = state.incidents.find(i => i.id === a.incidentId)
+  if (inc) {
+    inc.appeal = { by: b.captainName, at: nowStr.value, text }
+    if (inc.status === 'open' || inc.status === 'resolved') inc.status = 'mediating'
+    inc.actions.push({ at: nowStr.value, by: 'captain', text: `队长申诉：${text}` })
+  }
+  tl(b, `队长就半场释放提交申诉：${text}（等待管理员复核，R-MERGE-3）`, 'warning')
+  notify('admin', `${b.teamName} 就半场释放提交申诉，请在事件工单中复核裁决`)
+}
+
+/** 管理员对释放半场申诉作出裁决 */
+export function ruleAdjustAppeal(incidentId: string, ruling: string) {
+  const inc = state.incidents.find(x => x.id === incidentId)!
+  inc.ruling = ruling
+  inc.status = 'resolved'
+  inc.ruleApplied = Array.from(new Set([...(inc.ruleApplied ?? []), 'R-MERGE-3']))
+  inc.actions.push({ at: nowStr.value, by: 'admin', text: `申诉复核裁决：${ruling}。结论已同步双方并留痕` })
+  for (const bid of inc.bookingIds) {
+    const b = state.bookings.find(x => x.id === bid)
+    b?.timeline.push({ at: nowStr.value, text: `【${inc.title}】申诉裁决：${ruling}`, tone: 'warning' })
+  }
+  notify('captain', '你的半场释放申诉已完成复核，结论已同步')
+}
+
+/** 需要队长三选一的全场预约 */
+export function shortageBookings(): Booking[] {
+  return state.bookings.filter(b =>
+    b.adjust && (b.adjust.status === 'prompting' || b.adjust.status === 'rejected') &&
+    b.scope === 'full')
+}
+
 // ---------- 照明与结算 ----------
 export function payDeposit(bookingId: string) {
   const b = state.bookings.find(x => x.id === bookingId)!
@@ -284,12 +571,24 @@ export function endUsage(bookingId: string, forced = false): SettleResult {
   const items: FeeItem[] = [...statics]
   if (summary.light) {
     const q = summary.light
-    items.unshift({
-      kind: 'lighting',
-      label: `照明费 ${q.minutes} 分钟${b.scope === 'full' ? '（全场）' : ''}${q.rate < 1 ? ' × 拼场 8 折' : ''}，签到 ${checkedInCount(b)} 人平摊`,
-      amount: Math.round(q.fee * 100) / 100,
-      ruleId: 'R-LIGHT-1'
-    })
+    const split = b.lighting.splitAt
+    const surrendered = b.adjust?.status === 'surrendered'
+    items.unshift(split && q.segments.length > 1
+      ? {
+          kind: 'lighting' as const,
+          label: surrendered
+            ? `照明费分段计费 共 ${q.minutes} 分钟（${split} 起坚持包场·全场原价）`
+            : `照明费分段重算 共 ${q.minutes} 分钟（分界 ${split}）`,
+          amount: Math.round(q.fee * 100) / 100,
+          ruleId: surrendered ? 'R-MERGE-2' : 'R-MERGE-4',
+          note: q.segments.map(s => `${s.label} ${s.minutes}分×¥${court?.lighting.pricePerMinute ?? 0}${s.factor === 2 ? '×2半场' : ''}${s.rate < 1 ? '×8折' : ''}`).join('；')
+        }
+      : {
+          kind: 'lighting' as const,
+          label: `照明费 ${q.minutes} 分钟${b.scope === 'full' ? '（全场）' : ''}${q.rate < 1 ? ' × 拼场 8 折' : ''}，签到 ${checkedInCount(b)} 人平摊`,
+          amount: Math.round(q.fee * 100) / 100,
+          ruleId: 'R-LIGHT-1'
+        })
     b.lighting.minutes = q.minutes
     b.lighting.fee = Math.round(q.fee * 100) / 100
   }
